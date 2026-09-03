@@ -359,7 +359,7 @@ struct server_slot_stats {
     uint64_t n_draft_tokens      = 0;
     uint64_t n_draft_accepted    = 0;
     uint64_t n_draft_verif_steps = 0;
-    int32_t  draft_n_max_eff     = -1; // effective draft cap applied in the last step (adaptive budget), -1 = n/a
+    int32_t  draft_n_max_eff     = -1; // draft cap imposed by --spec-adaptive-budget in the last step, -1 = n/a
 
     // these are absolute timestamps (in us)
     // note: must be signed - they are subtracted before the later ones are set

@@ -2997,7 +2997,7 @@ private:
 
                 const int n_draft_max = std::min(slot.get_n_draft_max(), n_draft_budget);
 
-                slot.stats.draft_n_max_eff = n_draft_budget == std::numeric_limits<int>::max() ? -1 : n_draft_max;
+                slot.stats.draft_n_max_eff = n_draft_budget == std::numeric_limits<int>::max() ? -1 : n_draft_budget;
 
                 if (n_draft_max > 0) {
                     GGML_ASSERT(slot.can_speculate());
