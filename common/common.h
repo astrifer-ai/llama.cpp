@@ -325,6 +325,7 @@ struct common_params_model {
 struct common_params_speculative_draft {
     int32_t n_max = 3; // maximum number of tokens to draft during speculative decoding
     int32_t n_min = 0; // minimum number of draft tokens to use for speculative decoding
+    int32_t adaptive_budget = 0; // if > 0: per decode step, cap the draft length so that (n_generating_slots * (n_draft + 1)) <= budget (0 = off)
 
     float p_split = 0.1f; // speculative decoding split probability
     float p_min   = 0.0f; // minimum speculative decoding probability (greedy)

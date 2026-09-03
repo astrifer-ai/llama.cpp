@@ -18,6 +18,7 @@
 #include "mtmd-helper.h"
 
 #include <algorithm>
+#include <limits>
 #include <cstddef>
 #include <cinttypes>
 #include <exception>
@@ -2953,6 +2954,26 @@ private:
         std::vector<server_slot *> generating;
         std::vector<server_slot *> drafting;
 
+        // adaptive speculation: cap the draft length so that n_generating * (n_draft + 1) <= budget
+        // (on MoE models the mul_mat_id fast path is limited to a small number of tokens per step)
+        int n_draft_budget = std::numeric_limits<int>::max();
+        if (spec && params_base.speculative.draft.adaptive_budget > 0) {
+            int n_gen_slots = 0;
+            iterate(slots, [&](server_slot & s) {
+                if (s.state == SLOT_STATE_GENERATING) {
+                    n_gen_slots++;
+                }
+            });
+            if (n_gen_slots > 0) {
+                n_draft_budget = std::max(0, params_base.speculative.draft.adaptive_budget / n_gen_slots - 1);
+            }
+            static int n_draft_budget_last = -1;
+            if (n_draft_budget != n_draft_budget_last) {
+                SRV_INF("adaptive speculation: %d generating slot(s) -> draft cap %d (budget %d)\n", n_gen_slots, n_draft_budget, params_base.speculative.draft.adaptive_budget);
+                n_draft_budget_last = n_draft_budget;
+            }
+        }
+
         // determine which slots are generating and drafting
         iterate(slots, [&](server_slot & slot) {
             if (slot.state != SLOT_STATE_GENERATING) {
@@ -2974,7 +2995,9 @@ private:
                 const bool use_ckpt_tgt = ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL;
                 const bool use_ckpt_dft = ctx_dft_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL;
 
-                const int n_draft_max = slot.get_n_draft_max();
+                const int n_draft_max = std::min(slot.get_n_draft_max(), n_draft_budget);
+
+                slot.stats.draft_n_max_eff = n_draft_budget == std::numeric_limits<int>::max() ? -1 : n_draft_max;
 
                 if (n_draft_max > 0) {
                     GGML_ASSERT(slot.can_speculate());

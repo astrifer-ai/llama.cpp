@@ -83,6 +83,9 @@ json server_slot_stats::to_json() const {
         base["draft_n"]          = n_draft_tokens;
         base["draft_n_accepted"] = n_draft_accepted;
     }
+    if (draft_n_max_eff >= 0) {
+        base["draft_n_max_eff"] = draft_n_max_eff;
+    }
 
     return base;
 }
