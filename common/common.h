@@ -632,6 +632,16 @@ struct common_params {
     int32_t checkpoint_min_step = 8192;  // minimum spacing between context checkpoints
     int32_t cache_ram_mib       = 8192;  // -1 = no limit, 0 - disable, 1 = 1 MiB, etc.
 
+    // prefill/decode separation: a second llama_context on the same model, used only to process
+    // long prompts; the resulting sequence state is moved into the decode context in memory
+    int32_t prefill_ctx        = 0;     // KV size (tokens) of the prefill context; 0 = feature disabled
+    int32_t prefill_slots      = 1;     // number of sequences (concurrent prefills) in the prefill context
+    int32_t prefill_threshold  = 4096;  // route a request when its uncached prompt is at least this long
+    int32_t prefill_ubatch     = 0;     // micro-batch size on the prefill context; 0 = use n_ubatch
+    int32_t prefill_interleave = 1;     // prefill micro-batches per decode step of the main context
+    bool    prefill_first      = false; // run the prefill micro-batches before (true) or after (false) the decode step
+    bool    prefill_async      = false; // drive the prefill context from its own thread instead of the update_slots() loop
+
     std::string hostname      = "127.0.0.1";
     std::string public_path   = "";                                                                         // NOLINT
     std::string api_prefix    = "";                                                                         // NOLINT

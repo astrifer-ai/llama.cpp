@@ -1718,6 +1718,72 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_CACHE_RAM").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
     add_opt(common_arg(
+        {"--prefill-ctx"}, "N",
+        string_format("in-process prefill/decode separation: create a second llama_context on the same model with a KV cache of N tokens and process long prompts there; 0 = disabled (default: %d)", params.prefill_ctx),
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("invalid value");
+            }
+            params.prefill_ctx = value;
+        }
+    ).set_env("LLAMA_ARG_PREFILL_CTX").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--prefill-slots"}, "N",
+        string_format("number of concurrent prefills on the prefill context (default: %d)", params.prefill_slots),
+        [](common_params & params, int value) {
+            if (value < 1) {
+                throw std::invalid_argument("invalid value");
+            }
+            params.prefill_slots = value;
+        }
+    ).set_env("LLAMA_ARG_PREFILL_SLOTS").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--prefill-threshold"}, "N",
+        string_format("route a request to the prefill context when its uncached prompt is at least N tokens (default: %d)", params.prefill_threshold),
+        [](common_params & params, int value) {
+            if (value < 1) {
+                throw std::invalid_argument("invalid value");
+            }
+            params.prefill_threshold = value;
+        }
+    ).set_env("LLAMA_ARG_PREFILL_THRESHOLD").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--prefill-ubatch"}, "N",
+        string_format("micro-batch size used on the prefill context; 0 = use --ubatch-size (default: %d)", params.prefill_ubatch),
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("invalid value");
+            }
+            params.prefill_ubatch = value;
+        }
+    ).set_env("LLAMA_ARG_PREFILL_UBATCH").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--prefill-interleave"}, "N",
+        string_format("number of prefill micro-batches per decode step of the main context (default: %d)", params.prefill_interleave),
+        [](common_params & params, int value) {
+            if (value < 1) {
+                throw std::invalid_argument("invalid value");
+            }
+            params.prefill_interleave = value;
+        }
+    ).set_env("LLAMA_ARG_PREFILL_INTERLEAVE").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--prefill-first"},
+        {"--no-prefill-first"},
+        string_format("run the prefill micro-batches before the decode step of the main context instead of after it (default: %s)", params.prefill_first ? "enabled" : "disabled"),
+        [](common_params & params, bool value) {
+            params.prefill_first = value;
+        }
+    ).set_env("LLAMA_ARG_PREFILL_FIRST").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--prefill-async"},
+        {"--no-prefill-async"},
+        string_format("drive the prefill context from its own thread, so its decode calls overlap with the main context's instead of being interleaved with them (default: %s)", params.prefill_async ? "enabled" : "disabled"),
+        [](common_params & params, bool value) {
+            params.prefill_async = value;
+        }
+    ).set_env("LLAMA_ARG_PREFILL_ASYNC").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
         {"-kvu", "--kv-unified"},
         {"-no-kvu", "--no-kv-unified"},
         "use single unified KV buffer shared across all sequences (default: enabled if number of slots is auto)",

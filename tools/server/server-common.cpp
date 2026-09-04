@@ -87,6 +87,14 @@ json server_slot_stats::to_json() const {
         base["draft_n_max_eff"] = draft_n_max_eff;
     }
 
+    if (prefill_ctx_on) {
+        base["route"] = routed_prefill ? "prefill_ctx" : "direct";
+        if (routed_prefill) {
+            base["prefill_ctx_ms"] = t_prefill_ctx_ms;
+            base["handoff_ms"]     = t_handoff_ms;
+        }
+    }
+
     return base;
 }
 

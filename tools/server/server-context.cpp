@@ -27,6 +27,10 @@
 #include <random>
 #include <utility>
 #include <fstream>
+#include <list>
+#include <mutex>
+#include <thread>
+#include <condition_variable>
 
 // fix problem with std::min and std::max
 #if defined(_WIN32)
@@ -105,6 +109,7 @@ enum slot_state {
     SLOT_STATE_PROCESSING_PROMPT,
     SLOT_STATE_DONE_PROMPT,
     SLOT_STATE_GENERATING,
+    SLOT_STATE_PREFILL_EXT, // the prompt is being processed on the dedicated prefill context (--prefill-ctx)
 };
 
 struct server_slot; // forward declaration
@@ -267,6 +272,13 @@ struct server_slot {
     // used to determine the slot that has been used the longest
     int64_t t_last_used = -1;
 
+    // --prefill-ctx: time at which this request was handed to the prefill context (0 = not routed).
+    // used to make the reported prompt time cover the prefill-context work as well
+    int64_t t_prefill_start = 0;
+
+    // --prefill-ctx: id of a task that was given back to the decode context, so it is not routed again
+    int prefill_declined_task = -1;
+
     // generation props
     int32_t n_ctx   = 0;  // context size per slot
     int32_t n_keep  = 0;
@@ -397,6 +409,9 @@ struct server_slot {
         n_accepted_per_pos.clear();
 
         n_predict_max = -1;
+
+        t_prefill_start = 0;
+        prefill_declined_task = -1;
 
         llama_set_sampler(ctx_tgt, id, nullptr);
 
@@ -915,6 +930,59 @@ private:
 
     std::unique_ptr<server_prompt_cache> prompt_cache;
 
+    //
+    // in-process prefill/decode separation (--prefill-ctx)
+    //
+    // a second llama_context is created on the *same* llama_model (so the weights are shared, no
+    // second copy) and is used only to process long prompts. When a prompt is done, its sequence
+    // state is moved into the decode context in memory, and generation continues there.
+    //
+    // [TAG_PREFILL_CTX_HANDOFF] the state that is moved must end one token *before* the request's
+    // last token: this model is hybrid (recurrent layers keep a state that only exists at the last
+    // position) and a restored sequence carries no context checkpoint, so a slot whose cache equals
+    // the request exactly would be rewound by one token and reset to 0 instead. Leaving one token
+    // for the decode context guarantees >= 1 new token and no rewind.
+
+    enum prefill_job_state {
+        PREFILL_JOB_PENDING, // not finished yet (sync mode: advanced by the main loop)
+        PREFILL_JOB_RUNNING, // owned by the prefill worker thread (--prefill-async)
+        PREFILL_JOB_DONE,    // the prompt is processed, waiting for the main thread to hand it over
+        PREFILL_JOB_FAILED,
+    };
+
+    struct server_prefill_job {
+        int id_slot = -1;
+        int id_task = -1;
+        int id_seq  = -1; // sequence id inside ctx_prefill
+
+        llama_tokens tokens; // prompt without its last token
+        int n_past = 0;
+
+        int64_t t_start  = 0;
+        int64_t t_ctx_us = 0; // accumulated llama_decode() time on the prefill context
+
+        prefill_job_state state = PREFILL_JOB_PENDING;
+        bool cancel = false;
+    };
+
+    llama_context * ctx_prefill = nullptr;
+    int32_t n_ctx_prefill_seq   = 0; // usable context per prefill sequence
+    int32_t n_ubatch_prefill    = 0; // tokens submitted per prefill micro-batch
+
+    llama_batch batch_prefill = {};
+    bool batch_prefill_owned  = false;
+
+    // std::list: a job that the worker thread is decoding must not be moved in memory
+    std::list<server_prefill_job> prefill_jobs;
+    std::vector<bool>             prefill_seq_busy;
+    std::vector<uint8_t>          handoff_buf;
+
+    std::mutex              prefill_mtx;     // guards prefill_jobs / prefill_seq_busy / prefill_stop
+    std::mutex              prefill_ctx_mtx; // guards every use of ctx_prefill and batch_prefill
+    std::condition_variable prefill_cv;
+    std::thread             prefill_thread;
+    bool                    prefill_stop = false;
+
     server_metrics metrics;
 
     // queued prompt stats - llama_decode() is async, so the timing is only valid after a sync
@@ -937,6 +1005,30 @@ private:
     int64_t t_last_load_progress_ms = 0;
 
     void destroy() {
+        if (prefill_thread.joinable()) {
+            {
+                std::lock_guard<std::mutex> lock(prefill_mtx);
+                prefill_stop = true;
+            }
+            prefill_cv.notify_all();
+            prefill_thread.join();
+        }
+        prefill_stop = false;
+
+        prefill_jobs.clear();
+        prefill_seq_busy.clear();
+
+        if (batch_prefill_owned) {
+            llama_batch_free(batch_prefill);
+            batch_prefill = {};
+            batch_prefill_owned = false;
+        }
+
+        if (ctx_prefill) {
+            llama_free(ctx_prefill);
+            ctx_prefill = nullptr;
+        }
+
         spec.reset();
         spec_init.reset();
 
@@ -1233,6 +1325,60 @@ private:
             if (n_ctx_capped > n_ctx_train) {
                 SRV_WRN("the slot context (%d) exceeds the training context of the model (%d) - capping\n",
                         n_ctx_capped, n_ctx_train);
+            }
+        }
+
+        // create the dedicated prefill context (shares the model weights with ctx_tgt)
+        if (params_base.prefill_ctx > 0) {
+            if (mctx) {
+                SRV_ERR("%s", "--prefill-ctx is not supported together with a multimodal projector\n");
+                return false;
+            }
+
+            auto cparams_prefill = common_context_params_to_llama(params_base);
+
+            // one KV stream per prefill slot, each holding --prefill-ctx tokens
+            cparams_prefill.n_seq_max             = params_base.prefill_slots;
+            cparams_prefill.n_ctx                 = (uint32_t) params_base.prefill_ctx * params_base.prefill_slots;
+            cparams_prefill.kv_unified            = false;
+            cparams_prefill.n_rs_seq              = 0; // no speculative rollback on the prefill context
+            cparams_prefill.n_outputs_max         = 1; // the prefill context never needs logits
+            cparams_prefill.n_outputs_max_per_seq = 1;
+            cparams_prefill.embeddings            = false;
+            cparams_prefill.samplers              = nullptr;
+            cparams_prefill.n_samplers            = 0;
+
+            if (params_base.prefill_ubatch > 0) {
+                cparams_prefill.n_ubatch = params_base.prefill_ubatch;
+                cparams_prefill.n_batch  = std::max<uint32_t>(cparams_prefill.n_batch, cparams_prefill.n_ubatch);
+            }
+
+            ctx_prefill = llama_init_from_model(model_tgt, cparams_prefill);
+            if (ctx_prefill == nullptr) {
+                SRV_ERR("%s", "failed to create the prefill context\n");
+                return false;
+            }
+
+            n_ctx_prefill_seq = (int32_t) llama_n_ctx_seq(ctx_prefill);
+            n_ubatch_prefill  = params_base.prefill_ubatch > 0
+                ? params_base.prefill_ubatch
+                : (int32_t) llama_n_ubatch(ctx_prefill);
+            n_ubatch_prefill  = std::min<int32_t>(n_ubatch_prefill, (int32_t) llama_n_batch(ctx_prefill));
+
+            batch_prefill       = llama_batch_init(n_ubatch_prefill, 0, 1);
+            batch_prefill_owned = true;
+
+            prefill_seq_busy.assign(params_base.prefill_slots, false);
+            prefill_jobs.clear();
+
+            SRV_INF("prefill context: %d slot(s) x %d tokens, ubatch = %d, threshold = %d, interleave = %d, order = %s, async = %s\n",
+                    params_base.prefill_slots, n_ctx_prefill_seq, n_ubatch_prefill,
+                    params_base.prefill_threshold, params_base.prefill_interleave,
+                    params_base.prefill_first ? "prefill-first" : "decode-first",
+                    params_base.prefill_async ? "yes" : "no");
+
+            if (params_base.prefill_async) {
+                prefill_thread = std::thread([this]() { prefill_worker(); });
             }
         }
 
@@ -1812,6 +1958,8 @@ private:
         slot.state = slot.task->is_child()
             ? SLOT_STATE_WAIT_OTHER // wait for the parent to process prompt
             : SLOT_STATE_STARTED;
+
+        slot.stats.prefill_ctx_on = ctx_prefill != nullptr;
 
         // reset server kill-switch counter
         n_empty_consecutive = 0;
@@ -2764,6 +2912,356 @@ private:
     };
 #endif
 
+
+    //
+    // in-process prefill/decode separation (--prefill-ctx)
+    //
+
+    int prefill_seq_acquire() {
+        for (size_t i = 0; i < prefill_seq_busy.size(); ++i) {
+            if (!prefill_seq_busy[i]) {
+                prefill_seq_busy[i] = true;
+                return (int) i;
+            }
+        }
+
+        return -1;
+    }
+
+    void prefill_seq_release(int id_seq) {
+        GGML_ASSERT(id_seq >= 0 && (size_t) id_seq < prefill_seq_busy.size());
+        prefill_seq_busy[id_seq] = false;
+    }
+
+    // decide whether a slot that is about to start processing its prompt should be routed to the
+    // prefill context instead. returns true if the slot was routed.
+    bool prefill_try_route(server_slot & slot) {
+        if (!ctx_prefill || slot.state != SLOT_STATE_STARTED || !slot.task) {
+            return false;
+        }
+
+        if (slot.task->type != SERVER_TASK_TYPE_COMPLETION) {
+            return false;
+        }
+
+        // this task was already tried on the prefill context and given back - do not loop
+        if (slot.prefill_declined_task == slot.task->id) {
+            return false;
+        }
+
+        if (slot.task->is_parent() || slot.task->is_child()) {
+            return false;
+        }
+
+        // the handoff relies on the slot's prompt cache to pick the moved tokens up again
+        if (!slot.task->params.cache_prompt) {
+            return false;
+        }
+
+        if (mctx || slot.task->tokens.has_mtmd) {
+            return false;
+        }
+
+        if (!lora_get_enabled_ids(slot.lora).empty()) {
+            return false;
+        }
+
+        const int n_prompt = slot.task->n_tokens();
+
+        // [TAG_PREFILL_CTX_HANDOFF]: hand off prompt[:-1]
+        const int n_prefill = n_prompt - 1;
+
+        if (n_prefill < 1 || n_prefill > n_ctx_prefill_seq || n_prompt >= slot.n_ctx) {
+            return false;
+        }
+
+        const int n_cached   = (int) slot.prompt.tokens.get_common_prefix(slot.task->tokens);
+        const int n_uncached = n_prompt - n_cached;
+
+        if (n_uncached < params_base.prefill_threshold) {
+            return false;
+        }
+
+        // the prefill context always starts at position 0, so routing would redo the cached prefix -
+        // only worth it when the slot cannot already reuse more than we would have to redo
+        if (n_cached > n_uncached) {
+            return false;
+        }
+
+        std::lock_guard<std::mutex> lock(prefill_mtx);
+
+        const int id_seq = prefill_seq_acquire();
+        if (id_seq < 0) {
+            return false; // all prefill sequences are busy - process this prompt normally
+        }
+
+        server_prefill_job job;
+
+        job.id_slot = slot.id;
+        job.id_task = slot.task->id;
+        job.id_seq  = id_seq;
+        job.tokens  = slot.task->tokens.get_text_tokens();
+        job.tokens.resize(n_prefill);
+        job.t_start = ggml_time_us();
+
+        {
+            std::lock_guard<std::mutex> lock_ctx(prefill_ctx_mtx);
+            llama_memory_seq_rm(llama_get_memory(ctx_prefill), id_seq, -1, -1);
+        }
+
+        // the moved state replaces whatever this slot still holds
+        slot.prompt_clear();
+
+        slot.state           = SLOT_STATE_PREFILL_EXT;
+        slot.t_prefill_start = job.t_start;
+
+        slot.stats.routed_prefill = true;
+
+        prefill_jobs.push_back(std::move(job));
+
+        SLT_INF(slot, "routed to the prefill context: n_prompt = %d, n_prefill = %d, n_cached = %d, prefill seq = %d\n",
+                n_prompt, n_prefill, n_cached, id_seq);
+
+        prefill_cv.notify_all();
+
+        return true;
+    }
+
+    // move a finished prefill state into the decode context's slot
+    // note: only ever called from the main thread - it touches ctx_tgt
+    // returns false if the state could not be moved (the caller falls back to a direct prefill)
+    bool prefill_handoff(server_prefill_job & job, server_slot & slot) {
+        const int64_t t_start = ggml_time_us();
+
+        size_t n_get = 0;
+        {
+            std::lock_guard<std::mutex> lock_ctx(prefill_ctx_mtx);
+
+            const size_t size = llama_state_seq_get_size_ext(ctx_prefill, job.id_seq, LLAMA_STATE_SEQ_FLAGS_NONE);
+
+            handoff_buf.resize(size);
+
+            n_get = llama_state_seq_get_data_ext(ctx_prefill, handoff_buf.data(), size, job.id_seq, LLAMA_STATE_SEQ_FLAGS_NONE);
+        }
+
+        if (n_get == 0) {
+            SLT_ERR(slot, "%s", "failed to read the sequence state from the prefill context\n");
+            return false;
+        }
+
+        // the destination sequence must be empty, otherwise the restored cells are duplicated
+        slot.prompt_clear();
+
+        const size_t n_set = llama_state_seq_set_data_ext(ctx_tgt, handoff_buf.data(), n_get, slot.id, LLAMA_STATE_SEQ_FLAGS_NONE);
+        if (n_set != n_get) {
+            SLT_ERR(slot, "failed to write the sequence state into the decode context (%zu / %zu bytes)\n", n_set, n_get);
+            slot.prompt_clear();
+            return false;
+        }
+
+        // tell the slot which tokens its memory now holds - this is what makes the normal
+        // prompt-cache path reuse them ([TAG_PREFILL_CTX_HANDOFF]: exactly one token is left over)
+        slot.prompt.tokens.clear();
+        slot.prompt.tokens.insert(job.tokens);
+        slot.prompt.checkpoints.clear();
+
+        slot.stats.t_prefill_ctx_ms = job.t_ctx_us / 1000.0;
+        slot.stats.t_handoff_ms     = (ggml_time_us() - t_start) / 1000.0;
+
+        SLT_INF(slot, "prefill handoff: %d tokens, prefill_ctx = %.2f ms (%.1f tok/s), handoff = %.2f ms, state = %.1f MiB\n",
+                (int) job.tokens.size(), slot.stats.t_prefill_ctx_ms,
+                slot.stats.t_prefill_ctx_ms > 0.0 ? 1000.0*job.tokens.size()/slot.stats.t_prefill_ctx_ms : 0.0,
+                slot.stats.t_handoff_ms, n_get / (1024.0*1024.0));
+
+        return true;
+    }
+
+    // submit one micro-batch of a job to the prefill context; returns the llama_decode() return code
+    int prefill_decode_one(server_prefill_job & job) {
+        const int n_left = (int) job.tokens.size() - job.n_past;
+        const int n_cur  = std::min(n_left, n_ubatch_prefill);
+
+        GGML_ASSERT(n_cur > 0);
+
+        int ret = 0;
+
+        {
+            std::lock_guard<std::mutex> lock_ctx(prefill_ctx_mtx);
+
+            common_batch_clear(batch_prefill);
+            for (int i = 0; i < n_cur; ++i) {
+                common_batch_add(batch_prefill, job.tokens[job.n_past + i], job.n_past + i, { job.id_seq }, false);
+            }
+
+            const int64_t t0 = ggml_time_us();
+            ret = llama_decode(ctx_prefill, batch_prefill);
+            job.t_ctx_us += ggml_time_us() - t0;
+        }
+
+        if (ret == 0) {
+            job.n_past += n_cur;
+        }
+
+        return ret;
+    }
+
+    // give a job back to the decode context (fall back to a direct prefill)
+    void prefill_abandon(server_prefill_job & job, server_slot & slot) {
+        slot.prompt_clear();
+
+        slot.t_prefill_start       = 0;
+        slot.stats.routed_prefill  = false;
+        slot.prefill_declined_task = job.id_task;
+
+        slot.state = SLOT_STATE_STARTED;
+
+        SLT_WRN(slot, "%s", "the prefill context could not take this request - processing it on the decode context\n");
+    }
+
+    void prefill_release_seq(int id_seq) {
+        {
+            std::lock_guard<std::mutex> lock_ctx(prefill_ctx_mtx);
+            llama_memory_seq_rm(llama_get_memory(ctx_prefill), id_seq, -1, -1);
+        }
+        prefill_seq_release(id_seq);
+    }
+
+    // main thread: hand finished jobs over, drop jobs whose task disappeared, and - in the
+    // synchronous mode - advance every running job by one micro-batch
+    void prefill_update() {
+        if (!ctx_prefill) {
+            return;
+        }
+
+        const int n_rounds = params_base.prefill_async ? 1 : params_base.prefill_interleave;
+
+        for (int round = 0; round < n_rounds; ++round) {
+            std::unique_lock<std::mutex> lock(prefill_mtx);
+
+            if (prefill_jobs.empty()) {
+                return;
+            }
+
+            for (auto it = prefill_jobs.begin(); it != prefill_jobs.end();) {
+                auto & job = *it;
+
+                GGML_ASSERT(job.id_slot >= 0 && (size_t) job.id_slot < slots.size());
+                server_slot & slot = slots[job.id_slot];
+
+                // the task was cancelled / aborted in the meantime
+                if (slot.state != SLOT_STATE_PREFILL_EXT || !slot.task || slot.task->id != job.id_task) {
+                    if (job.state == PREFILL_JOB_RUNNING) {
+                        job.cancel = true; // let the worker notice and stop first
+                        ++it;
+                        continue;
+                    }
+
+                    SRV_INF("prefill job for slot %d dropped (task %d is gone)\n", job.id_slot, job.id_task);
+
+                    prefill_release_seq(job.id_seq);
+                    it = prefill_jobs.erase(it);
+                    continue;
+                }
+
+                if (job.state == PREFILL_JOB_PENDING && !params_base.prefill_async) {
+                    const int ret = prefill_decode_one(job);
+
+                    if (ret != 0) {
+                        SLT_ERR(slot, "prefill context decode failed (ret = %d) - falling back to a direct prefill\n", ret);
+                        job.state = PREFILL_JOB_FAILED;
+                    } else if (job.n_past >= (int) job.tokens.size()) {
+                        job.state = PREFILL_JOB_DONE;
+                    }
+                }
+
+                if (job.state == PREFILL_JOB_DONE || job.state == PREFILL_JOB_FAILED) {
+                    const bool ok = job.state == PREFILL_JOB_DONE && prefill_handoff(job, slot);
+
+                    prefill_release_seq(job.id_seq);
+
+                    if (ok) {
+                        // continue on the decode context: the normal prompt path finds exactly one new token
+                        slot.state = SLOT_STATE_STARTED;
+                    } else {
+                        prefill_abandon(job, slot);
+                    }
+
+                    it = prefill_jobs.erase(it);
+                    continue;
+                }
+
+                ++it;
+            }
+        }
+    }
+
+    // --prefill-async: the prefill context is driven by its own thread, so its llama_decode() calls
+    // overlap with the decode context's instead of being serialized with them
+    void prefill_worker() {
+        while (true) {
+            server_prefill_job * job = nullptr;
+
+            {
+                std::unique_lock<std::mutex> lock(prefill_mtx);
+
+                prefill_cv.wait(lock, [&]() {
+                    if (prefill_stop) {
+                        return true;
+                    }
+                    for (auto & j : prefill_jobs) {
+                        if (j.state == PREFILL_JOB_PENDING && !j.cancel) {
+                            return true;
+                        }
+                    }
+                    return false;
+                });
+
+                if (prefill_stop) {
+                    return;
+                }
+
+                for (auto & j : prefill_jobs) {
+                    if (j.state == PREFILL_JOB_PENDING && !j.cancel) {
+                        j.state = PREFILL_JOB_RUNNING;
+                        job = &j;
+                        break;
+                    }
+                }
+            }
+
+            if (job == nullptr) {
+                continue;
+            }
+
+            // note: the job object lives in a std::list, so this reference stays valid; the main
+            //       thread never erases a job while it is RUNNING
+            while (true) {
+                {
+                    std::unique_lock<std::mutex> lock(prefill_mtx);
+                    if (prefill_stop || job->cancel) {
+                        job->state = PREFILL_JOB_FAILED;
+                        break;
+                    }
+                }
+
+                const int ret = prefill_decode_one(*job);
+
+                std::unique_lock<std::mutex> lock(prefill_mtx);
+
+                if (ret != 0) {
+                    SRV_ERR("prefill context decode failed (ret = %d)\n", ret);
+                    job->state = PREFILL_JOB_FAILED;
+                    break;
+                }
+
+                if (job->n_past >= (int) job->tokens.size()) {
+                    job->state = PREFILL_JOB_DONE;
+                    break;
+                }
+            }
+        }
+    }
+
     void update_slots() {
 #ifdef DEBUG_TIMINGS
         static int64_t t_prev = 0;
@@ -2818,6 +3316,11 @@ private:
         }
 
         GGML_ASSERT(batch.slot_batched || batch.size() == 0);
+
+        // --prefill-first: give the prefill context its micro-batch(es) before the decode step
+        if (params_base.prefill_first) {
+            prefill_update();
+        }
 
         if (batch.slot_batched) {
             auto & slot_batched      = batch.slot_batched;
@@ -2878,9 +3381,30 @@ private:
                 break; // stop any further processing
             }
         }
+
+        // default order: one decode step of the main context, then the prefill micro-batch(es)
+        if (!params_base.prefill_first) {
+            prefill_update();
+        }
+
+        // in async mode the prefill runs on its own thread - do not spin the main loop while the
+        // only thing left to do is waiting for it
+        if (params_base.prefill_async && batch.size() == 0) {
+            std::lock_guard<std::mutex> lock(prefill_mtx);
+            if (!prefill_jobs.empty()) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(2));
+            }
+        }
     }
 
     void pre_decode() {
+        // route long prompts to the prefill context, if it is enabled
+        if (ctx_prefill) {
+            iterate(slots, [&](server_slot & slot) {
+                prefill_try_route(slot);
+            });
+        }
+
         // apply context-shift if needed
         // TODO: simplify and improve
         iterate(slots, [&](server_slot & slot) {
@@ -3127,6 +3651,11 @@ private:
                     return;
                 }
 
+                // the prompt of this slot is being processed on the prefill context (--prefill-ctx)
+                if (slot.state == SLOT_STATE_PREFILL_EXT) {
+                    return;
+                }
+
                 // this slot still has a prompt to be processed
                 if (slot.state == SLOT_STATE_PROCESSING_PROMPT || slot.state == SLOT_STATE_STARTED) {
                     const auto & input_tokens = slot.task->tokens;
@@ -3137,6 +3666,12 @@ private:
                     // TODO: maybe move branch to outside of this loop in the future
                     if (slot.state == SLOT_STATE_STARTED) {
                         slot.stats.update_prompt_start();
+
+                        // this request was prefilled on the prefill context - count that time too,
+                        // so prompt_ms / TTFT stay comparable with a direct request
+                        if (slot.t_prefill_start > 0) {
+                            slot.stats.t_start = slot.t_prefill_start;
+                        }
 
                         slot.state = SLOT_STATE_PROCESSING_PROMPT;
 

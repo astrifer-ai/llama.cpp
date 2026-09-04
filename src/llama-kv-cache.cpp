@@ -2143,7 +2143,29 @@ const slot_info_vec_t *   sinfos_in) {
     uint32_t n_stream_cur;
     io.read(&n_stream_cur, sizeof(n_stream_cur));
     if (n_stream_cur != n_stream) {
-        throw std::runtime_error("n_stream mismatch");
+        // a single-sequence state carries cells for at most one stream, so it can still be restored
+        // into a cache with a different stream count - this is what lets a sequence be moved between
+        // two contexts of the same model that were created with a different n_seq_max
+        // (e.g. llama-server's --prefill-ctx). Whole-context and mirrored restores still require an
+        // exact match, because there the stream index itself carries meaning.
+        // a whole-context restore replaces every stream, so there the stream index carries meaning
+        if (seq_id == -1) {
+            throw std::runtime_error(format("n_stream mismatch (%u != %u)", n_stream_cur, n_stream));
+        }
+
+        // a single-sequence state carries cells for at most one stream and all of them are restored
+        // into seq_to_stream[seq_id], so the source stream count does not have to match. The slot
+        // layout is keyed by the *source* stream index, so the two sections of one state still agree.
+        if (sinfos_out && sinfos_out->size() < n_stream_cur) {
+            sinfos_out->resize(n_stream_cur);
+        }
+
+        if (sinfos_in && sinfos_in->size() < n_stream_cur) {
+            throw std::runtime_error("failed to restore kv cache: mirrored slot layout has the wrong stream count");
+        }
+
+        LLAMA_LOG_DEBUG("%s: restoring a single-sequence state written with n_stream = %u into a cache with n_stream = %u\n",
+                __func__, n_stream_cur, n_stream);
     }
 
     // a whole-context restore replaces every stream, so the cache is emptied once here
@@ -2152,7 +2174,7 @@ const slot_info_vec_t *   sinfos_in) {
         clear(true);
     }
 
-    for (uint32_t s = 0; s < n_stream; ++s) {
+    for (uint32_t s = 0; s < n_stream_cur; ++s) {
         uint32_t cell_count;
         io.read(&cell_count, sizeof(cell_count));
 

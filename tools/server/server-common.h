@@ -361,6 +361,12 @@ struct server_slot_stats {
     uint64_t n_draft_verif_steps = 0;
     int32_t  draft_n_max_eff     = -1; // draft cap imposed by --spec-adaptive-budget in the last step, -1 = n/a
 
+    // in-process prefill/decode separation (--prefill-ctx)
+    bool   prefill_ctx_on = false; // --prefill-ctx is active on this server (gates the fields below)
+    bool   routed_prefill = false; // the prompt was processed on the prefill context
+    double t_prefill_ctx_ms = 0.0; // wall time spent prefilling this request on the prefill context
+    double t_handoff_ms     = 0.0; // time to move the sequence state prefill context -> decode context
+
     // these are absolute timestamps (in us)
     // note: must be signed - they are subtracted before the later ones are set
     int64_t t_start       = 0;
