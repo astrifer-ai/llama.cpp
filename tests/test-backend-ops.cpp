@@ -6780,6 +6780,37 @@ struct test_sum : public test_case {
     }
 };
 
+// GGML_OP_MUL_COLLAPSE
+struct test_mul_collapse : public test_case {
+    const ggml_type type;
+    const std::array<int64_t, 4> ne;
+    const float scale;
+
+    std::string vars() override {
+        return VARS_TO_STR3(type, ne, scale);
+    }
+
+    test_mul_collapse(ggml_type type = GGML_TYPE_F32,
+            std::array<int64_t, 4> ne = {2560, 4, 7, 1},
+            float scale = 0.25f)
+        : type(type), ne(ne), scale(scale) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * a = ggml_new_tensor(ctx, type, 4, ne.data());
+        ggml_set_param(a);
+        ggml_set_name(a, "a");
+
+        ggml_tensor * b = ggml_new_tensor(ctx, type, 4, ne.data());
+        ggml_set_param(b);
+        ggml_set_name(b, "b");
+
+        ggml_tensor * out = ggml_mul_collapse(ctx, a, b, scale);
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+};
+
 // GGML_OP_SUM_ROWS
 struct test_sum_rows : public test_case {
     const ggml_type type;
@@ -10031,6 +10062,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_sum(GGML_TYPE_F32, { 33, 1024, 1, 1 }));
     test_cases.emplace_back(new test_sum(GGML_TYPE_F32, { 33, 256, 1, 1 }));
     test_cases.emplace_back(new test_sum(GGML_TYPE_F32, { 33, 256, 1, 1 }, { 1, 0, 2, 3 })); // sum dst not-contiguous
+    test_cases.emplace_back(new test_mul_collapse(GGML_TYPE_F32, {2560, 4, 1,  1}, 0.25f));  // qwen4exp decode, 1 token
+    test_cases.emplace_back(new test_mul_collapse(GGML_TYPE_F32, {2560, 4, 5,  1}, 0.25f));  // 5 users
+    test_cases.emplace_back(new test_mul_collapse(GGML_TYPE_F32, {2560, 4, 512,1}, 0.25f));  // a prefill ubatch
+    test_cases.emplace_back(new test_mul_collapse(GGML_TYPE_F32, {1,    4, 3,  1}, 0.25f));  // narrow
+    test_cases.emplace_back(new test_mul_collapse(GGML_TYPE_F32, {33,   1, 3,  2}, 1.0f));   // ne1 = 1, 4-D
     test_cases.emplace_back(new test_sum_rows());
     test_cases.emplace_back(new test_sum_rows(GGML_TYPE_F32, { 11, 5, 6, 3 }, true, false));
     test_cases.emplace_back(new test_sum_rows(GGML_TYPE_F32, { 11, 5, 6, 3 }, false, true));

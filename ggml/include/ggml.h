@@ -590,6 +590,8 @@ extern "C" {
 
         GGML_OP_GLU,
 
+        GGML_OP_MUL_COLLAPSE,
+
         GGML_OP_COUNT,
     };
 
@@ -1048,6 +1050,17 @@ extern "C" {
     GGML_API struct ggml_tensor * ggml_sum_rows(
             struct ggml_context * ctx,
             struct ggml_tensor  * a);
+
+    // elementwise product of a and b, reduced over dim 1, scaled:
+    //   dst[i0, 0, i2, i3] = scale * sum_i1 a[i0, i1, i2, i3] * b[i0, i1, i2, i3]
+    // a and b must have the same shape, be F32 and contiguous.
+    // The reduction runs i1 ascending, so the result is bit-identical to
+    // scale * (((a*b)[..0..] + (a*b)[..1..]) + ...), which is what this replaces.
+    GGML_API struct ggml_tensor * ggml_mul_collapse(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            struct ggml_tensor  * b,
+            float                 scale);
 
     GGML_API struct ggml_tensor * ggml_cumsum(
         struct ggml_context * ctx,

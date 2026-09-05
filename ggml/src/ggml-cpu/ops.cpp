@@ -1455,6 +1455,68 @@ void ggml_compute_forward_cumsum(
     }
 }
 
+// ggml_compute_forward_mul_collapse
+
+static void ggml_compute_forward_mul_collapse_f32(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+
+    const ggml_tensor * src0 = dst->src[0];
+    const ggml_tensor * src1 = dst->src[1];
+
+    GGML_ASSERT(ggml_are_same_shape(src0, src1));
+    GGML_ASSERT(ggml_is_contiguous(src0));
+    GGML_ASSERT(ggml_is_contiguous(src1));
+    GGML_ASSERT(src0->type == GGML_TYPE_F32);
+    GGML_ASSERT(src1->type == GGML_TYPE_F32);
+    GGML_ASSERT(dst->type  == GGML_TYPE_F32);
+
+    float scale;
+    memcpy(&scale, dst->op_params, sizeof(float));
+
+    GGML_TENSOR_BINARY_OP_LOCALS
+
+    GGML_ASSERT(ne0 == ne00);
+    GGML_ASSERT(ne1 == 1);
+    GGML_ASSERT(ne2 == ne02);
+    GGML_ASSERT(ne3 == ne03);
+
+    // one output row (ne00 elements) per (i2, i3); split across threads
+    const int64_t nrows = ne02*ne03;
+    const int     ith   = params->ith;
+    const int     nth   = params->nth;
+
+    for (int64_t ir = ith; ir < nrows; ir += nth) {
+        const int64_t i2 = ir % ne02;
+        const int64_t i3 = ir / ne02;
+
+        float * dp = (float *) ((char *) dst->data + i2*nb2 + i3*nb3);
+
+        for (int64_t i0 = 0; i0 < ne00; ++i0) {
+            float acc = 0.0f;
+            // i1 ascending: same summation order as the add-chain this replaces
+            for (int64_t i1 = 0; i1 < ne01; ++i1) {
+                const float * ap = (const float *) ((const char *) src0->data + i1*nb01 + i2*nb02 + i3*nb03);
+                const float * bp = (const float *) ((const char *) src1->data + i1*nb11 + i2*nb12 + i3*nb13);
+                acc += ap[i0] * bp[i0];
+            }
+            dp[i0] = scale * acc;
+        }
+    }
+}
+
+void ggml_compute_forward_mul_collapse(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    switch (dst->src[0]->type) {
+        case GGML_TYPE_F32:
+            ggml_compute_forward_mul_collapse_f32(params, dst);
+            break;
+        default:
+            GGML_ABORT("fatal error");
+    }
+}
+
 // ggml_compute_forward_sum_rows
 
 static void ggml_compute_forward_sum_rows_f32(

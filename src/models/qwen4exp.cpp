@@ -325,20 +325,15 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_mix(
     ggml_tensor * gate = ggml_sigmoid(ctx0, build_lora_mm(w_up, lo));
     cb(gate, "hc_gate", il);
 
-    ggml_tensor * gated = ggml_mul(ctx0, xn, gate);
-    gated = ggml_reshape_3d(ctx0, gated, n_embd, hc, nt);
+    // Gate, then collapse the hc streams by their mean. Expressed as a graph this is
+    // mul + cont + (hc-1) x add + scale -- six dispatches per call, twice per layer, every
+    // one of them shorter than the ~2.26 us launch cost on this hardware. ggml_mul_collapse
+    // does the whole thing in one kernel, summing i1 ascending so the result is bit-identical.
+    ggml_tensor * xn3   = ggml_reshape_3d(ctx0, xn,   n_embd, hc, nt);
+    ggml_tensor * gate3 = ggml_reshape_3d(ctx0, gate, n_embd, hc, nt);
 
-    // collapse the streams by their mean
-    ggml_tensor * mixed = ggml_view_2d(ctx0, gated, n_embd, nt,
-            ggml_row_size(gated->type, n_embd) * hc, 0);
-    mixed = ggml_cont(ctx0, mixed);
-    for (int64_t c = 1; c < hc; ++c) {
-        ggml_tensor * s = ggml_view_2d(ctx0, gated, n_embd, nt,
-                ggml_row_size(gated->type, n_embd) * hc,
-                ggml_row_size(gated->type, n_embd) * c);
-        mixed = ggml_add(ctx0, mixed, s);
-    }
-    mixed = ggml_scale(ctx0, mixed, 1.0f / (float) hc);
+    ggml_tensor * mixed = ggml_mul_collapse(ctx0, xn3, gate3, 1.0f / (float) hc);
+    mixed = ggml_reshape_2d(ctx0, mixed, n_embd, nt);
     cb(mixed, "hc_mixed", il);
 
     if (inject) {

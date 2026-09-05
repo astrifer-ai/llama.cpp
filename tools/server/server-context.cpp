@@ -1342,7 +1342,12 @@ private:
             cparams_prefill.n_ctx                 = (uint32_t) params_base.prefill_ctx * params_base.prefill_slots;
             cparams_prefill.kv_unified            = false;
             cparams_prefill.n_rs_seq              = 0; // no speculative rollback on the prefill context
-            cparams_prefill.n_outputs_max         = 1; // the prefill context never needs logits
+            // The prefill context never needs logits, but llama_context construction calls
+            // output_reserve(n_seq_max) and asserts n_outputs <= cparams.n_outputs_max
+            // (llama-context.cpp:375 and :2199), so the cap has to cover one output per
+            // prefill slot or every --prefill-slots > 1 aborts at load time. The buffers are
+            // n_vocab-sized (~3 MB per slot here) and go unused; per-sequence stays at 1.
+            cparams_prefill.n_outputs_max         = params_base.prefill_slots;
             cparams_prefill.n_outputs_max_per_seq = 1;
             cparams_prefill.embeddings            = false;
             cparams_prefill.samplers              = nullptr;

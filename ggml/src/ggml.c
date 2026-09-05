@@ -1098,9 +1098,11 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "OPT_STEP_SGD",
 
     "GLU",
+
+    "MUL_COLLAPSE",
 };
 
-static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
+static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1213,9 +1215,11 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "sgd(x)",
 
     "glu(x)",
+
+    "collapse(a*b)",
 };
 
-static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
+static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -2498,6 +2502,30 @@ struct ggml_tensor * ggml_sum_rows(
 
     result->op     = GGML_OP_SUM_ROWS;
     result->src[0] = a;
+
+    return result;
+}
+
+struct ggml_tensor * ggml_mul_collapse(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a,
+        struct ggml_tensor  * b,
+        float                 scale) {
+    GGML_ASSERT(ggml_are_same_shape(a, b));
+    GGML_ASSERT(a->type == GGML_TYPE_F32);
+    GGML_ASSERT(b->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous(a));
+    GGML_ASSERT(ggml_is_contiguous(b));
+
+    const int64_t ne[GGML_MAX_DIMS] = { a->ne[0], 1, a->ne[2], a->ne[3] };
+
+    struct ggml_tensor * result = ggml_new_tensor(ctx, a->type, GGML_MAX_DIMS, ne);
+
+    ggml_set_op_params(result, &scale, sizeof(scale));
+
+    result->op     = GGML_OP_MUL_COLLAPSE;
+    result->src[0] = a;
+    result->src[1] = b;
 
     return result;
 }
