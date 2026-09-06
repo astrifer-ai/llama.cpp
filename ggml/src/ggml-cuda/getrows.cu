@@ -1,4 +1,6 @@
 #include "getrows.cuh"
+
+#include <cstdlib>
 #include "dequantize.cuh"
 #include "convert.cuh"
 
@@ -230,6 +232,75 @@ static void get_rows_cuda_kq(
         s10, s11, s12/*, s13*/);
 }
 
+// One workgroup per gathered row, with the row WIDTH spread across the block, is the right
+// mapping when rows are wide. It collapses when they are not. qwen4exp's QSA score expand
+// gathers n_kv rows whose width is n_tps -- which is 1 during decode -- so the default launch
+// is ne10*ne11*ne12 workgroups of CUDA_GET_ROWS_BLOCK_SIZE threads in which exactly ONE thread
+// is live. Measured on the shipping model at 131K x 4 (rocprofv3, decode steady state):
+// 525 312 workgroups per layer, 12 layers, 10.27 ms/step to move 2.1 MB. That is 147x off the
+// bandwidth bound and 6.6 % of the whole decode step -- the second largest term in the QSA path
+// and larger than the pooling fusion it feeds.
+//
+// This path flattens (row, column) onto a linear thread index so every lane is live. It is
+// chosen only when the row is narrow enough that the default mapping wastes most of the block;
+// wide rows keep the existing kernel, where the default mapping is correct and this one would
+// be worse, since it re-reads the gather index once per element rather than once per row.
+//
+// BIT-IDENTITY: get_rows performs NO ARITHMETIC -- it is a pure dst = src copy (with an
+// optional type cast that is per-element and mapping-independent). The output is therefore
+// bit-identical to the default path by construction, for every shape and every thread mapping.
+// There is no reduction order to preserve, no contraction to suppress and no signed zero to
+// protect. Compare that with gathermean.cu, where all three apply.
+template<typename src0_t, typename dst_t>
+static __global__ void k_get_rows_float_narrow(
+        const src0_t * src0_ptr, const int32_t * src1_ptr, dst_t * dst_ptr,
+        const int64_t ne10, const uint3 ne00_fdv,
+        const int64_t ne11, const uint3 ne12_fdv,
+        const size_t s1, const size_t s2, const size_t s3,
+        const size_t nb01, const size_t nb02, const size_t nb03,
+        const size_t s10, const size_t s11, const size_t s12) {
+
+    ggml_cuda_pdl_lc();
+    const src0_t  * GGML_CUDA_RESTRICT src0 = src0_ptr;
+    const int32_t * GGML_CUDA_RESTRICT src1 = src1_ptr;
+    dst_t         * GGML_CUDA_RESTRICT dst  = dst_ptr;
+    ggml_cuda_pdl_sync();
+
+    const int64_t ne00 = ne00_fdv.z;
+    const int64_t flat = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (flat < ne10*ne00) {
+        // flat = i10*ne00 + i00
+        const uint2 dr  = fast_div_modulo((uint32_t) flat, ne00_fdv);
+        const int   i10 = dr.x;
+        const int   i00 = dr.y;
+
+        for (int64_t z = blockIdx.y; z < ne11*(int64_t)ne12_fdv.z; z += gridDim.y) {
+            const uint2 dm  = fast_div_modulo((uint32_t) z, ne12_fdv);
+            const int   i11 = dm.x;
+            const int   i12 = dm.y;
+
+            const int i01 = src1[i10*s10 + i11*s11 + i12*s12];
+
+            dst_t * GGML_CUDA_RESTRICT dst_row =
+                dst + i10*s1 + i11*s2 + i12*s3;
+            const src0_t * GGML_CUDA_RESTRICT src0_row =
+                (const src0_t *)((const char *) src0 + i01*nb01 + i11*nb02 + i12*nb03);
+
+            dst_row[i00] = ggml_cuda_cast<dst_t>(src0_row[i00]);
+        }
+    }
+}
+
+// Set GGML_CUDA_GETROWS_NARROW=0 to force the default mapping, for an A/B on one binary.
+static bool ggml_cuda_getrows_narrow_enabled() {
+    static const bool enabled = [] {
+        const char * s = getenv("GGML_CUDA_GETROWS_NARROW");
+        return s == nullptr || atoi(s) != 0;
+    }();
+    return enabled;
+}
+
 template<typename src0_t, typename dst_t>
 static void get_rows_cuda_float(
         const src0_t * src0_d, const int32_t * src1_d, dst_t * dst_d,
@@ -253,6 +324,29 @@ static void get_rows_cuda_float(
     GGML_ASSERT(ne12 > 0);
     GGML_ASSERT(ne11 <= std::numeric_limits<uint32_t>::max() / ne12);
     const uint3 ne12_fdv = init_fastdiv_values(ne12);
+
+    // A row narrow enough that the default mapping leaves most of the block idle goes to the
+    // flattened path instead. Threshold is 1/4 of the block: at ne00 <= 64 the default launch
+    // wastes at least 75 % of every workgroup. The row count guard keeps the flattened launch
+    // from being chosen when there is not enough work to fill the device anyway.
+    if (ggml_cuda_getrows_narrow_enabled() &&
+            ne00*4 <= CUDA_GET_ROWS_BLOCK_SIZE &&
+            ne10*ne11*ne12 >= CUDA_GET_ROWS_BLOCK_SIZE) {
+        const uint3   ne00_fdv = init_fastdiv_values(ne00);
+        const int64_t nflat    = ne10*ne00;
+        const dim3    nb((nflat + CUDA_GET_ROWS_BLOCK_SIZE - 1) / CUDA_GET_ROWS_BLOCK_SIZE,
+                         MIN(ne11*ne12, UINT16_MAX), 1);
+
+        const ggml_cuda_kernel_launch_params lp = ggml_cuda_kernel_launch_params{nb, block_dims, 0, stream};
+        ggml_cuda_kernel_launch(k_get_rows_float_narrow<src0_t, dst_t>, lp,
+            src0_d, src1_d, dst_d,
+            ne10, ne00_fdv,
+            ne11, ne12_fdv,
+            s1, s2, s3,
+            nb01, nb02, nb03,
+            s10, s11, s12);
+        return;
+    }
 
     if constexpr (std::is_same<src0_t, dst_t>::value) {
         constexpr int VEC = 16 / sizeof(dst_t);

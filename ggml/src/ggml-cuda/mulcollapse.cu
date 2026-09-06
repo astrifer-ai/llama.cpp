@@ -64,13 +64,39 @@
 #  endif
 #endif
 
+// ===========================================================================================
+// THE INVARIANT IS BIT-AGREEMENT WITH THE REFERENCE, NOT "CONTRACTION OFF"
+//
+// Read the guard below as being about THIS kernel and its reference, not as a project rule.
+// Whether contraction must be suppressed depends entirely on what the unfused graph does:
+//
+//   * ggml_mul (this kernel's reference) writes every product to an f32 buffer, so the chain
+//     rounds where a contracted FMA would not -- contraction OFF is what matches.
+//   * rms_norm_f32 (norm.cu) computes `tmp += xi*xi` inside its own reduction, so a fused
+//     version of it forcing contraction off would INTRODUCE a divergence.
+//
+// The same applies to every other carrier of bit-identity. Seeding a pooling accumulator at
+// 0.0f flips the sign of an all-negative-zero q4_0 block (see gathermean.cu), while seeding
+// an rms_norm accumulator at 0.0f is safe because xi*xi is never negative. Two kernels, two
+// different traps, one discipline: derive the hazard from the reference each time.
+//
+// And some kernels carry no arithmetic at all: reshaping the launch of get_rows (a pure copy)
+// or rope (elementwise, no cross-thread reduction) cannot change an output bit for any shape,
+// so none of this machinery is engaged there.
+// ===========================================================================================
 #if !MUL_COLLAPSE_ROLLED
 #  if !defined(GGML_MUL_COLLAPSE_ALLOW_ARRAY_FALLBACK)
-#    error "GGML_OP_MUL_COLLAPSE requires FP contraction to be disabled in mul_collapse_f32, and \
-this compiler provides no mechanism this file knows about. Contraction turns the reduction into \
-an FMA, which skips the f32 product rounding that ggml_mul performs, and the op silently stops \
-being bit-identical to the mul+cont+add+scale chain it replaces (measured: 42.9% of elements \
-differ at the [2560,4,1,1] decode shape). test-backend-ops will NOT catch this -- it is a \
+#    error "mul_collapse_f32 must reproduce the roundings ITS OWN reference performs, and on \
+this compiler this file has no mechanism to make it do so. THIS IS NOT A PROJECT-WIDE RULE THAT \
+FP CONTRACTION MUST BE OFF. The invariant is bit-agreement with whatever the unfused graph \
+actually does; the pragma is only the instrument. Here the reference is ggml_mul, which \
+materialises every product into an f32 buffer, so the chain performs a product rounding that a \
+contracted FMA would skip -- for THIS kernel, contraction off is what matches (measured: 42.9% \
+of elements differ at the [2560,4,1,1] decode shape with it on). A reference that itself \
+contracts needs the opposite setting: rms_norm_f32 in norm.cu computes `tmp += xi*xi` in its own \
+reduction, so a fused version of THAT forcing contraction off would INTRODUCE the divergence \
+rather than prevent it. Derive the hazard from the reference each time; do not carry this \
+kernel\'s fix forward as a habit. test-backend-ops will NOT catch either error -- it is a \
 tolerance gate. Either add a contraction-disabling mechanism for this compiler above, or define \
 GGML_MUL_COLLAPSE_ALLOW_ARRAY_FALLBACK to use the materialised-product form after verifying it \
 on your target with an exact uint32 comparison against the unfused chain."

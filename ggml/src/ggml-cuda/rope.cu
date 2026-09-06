@@ -3,6 +3,8 @@
 #include "ggml.h"
 #include "rope.cuh"
 
+#include <cstdlib>
+
 struct rope_corr_dims {
     float v[2];
 };
@@ -290,6 +292,38 @@ static __global__ void rope_multi(const T *            x,
     dst[idst + n_offs/2 + n_dims/2] = x0*sin_theta + x1*cos_theta;
 }
 
+// The rope launch fixed the block at CUDA_ROPE_BLOCK_SIZE threads regardless of the row width,
+// and each thread handles ONE rotated pair, so only ne00/2 lanes are ever live. qwen4exp ropes
+// the pooled QSA block keys at ne00 = 128, which leaves 64 of 256 threads doing work: six of
+// every eight wave32s launch and retire at the `i0 >= ne00` bound. Measured on the shipping
+// model at 131K x 4 (rocprofv3, decode steady state): 131 328 workgroups per layer, 12 layers,
+// 11.53 ms/step against a 4.3 ms bandwidth bound -- 7.4 % of the whole decode step.
+//
+// Fitting the block to the row leaves the grid and the per-thread work untouched; it only stops
+// launching lanes that immediately exit. Reduces to the previous geometry for ne00 >= 512.
+//
+// BIT-IDENTITY: every rope thread computes one output pair from its own i0 with no shared
+// memory and no cross-thread communication -- blockDim.y feeds only `i0`. Re-shaping the block
+// therefore cannot change an output bit, for any shape. No reduction order, no contraction
+// concern, nothing to prove beyond this comment.
+//
+// Set GGML_CUDA_ROPE_BLOCKFIT=0 to restore the fixed block, for an A/B on one binary.
+static int ggml_cuda_rope_block_size(int ne00) {
+    static const bool enabled = [] {
+        const char * s = getenv("GGML_CUDA_ROPE_BLOCKFIT");
+        return s == nullptr || atoi(s) != 0;
+    }();
+
+    if (!enabled) {
+        return CUDA_ROPE_BLOCK_SIZE;
+    }
+
+    // one thread per rotated pair, rounded up to a full wave
+    const int need = (ne00 + 1)/2;
+
+    return MIN(CUDA_ROPE_BLOCK_SIZE, MAX(32, (need + 31)/32*32));
+}
+
 template <bool forward, bool has_ff, typename T>
 static __global__ void rope_vision(const T *            x,
                                    T *                  dst,
@@ -381,8 +415,9 @@ static void rope_norm_cuda(const T *            x,
                            const bool           inplace,
                            cudaStream_t         stream) {
     GGML_ASSERT(ne00 % 2 == 0);
-    const dim3 block_dims(1, CUDA_ROPE_BLOCK_SIZE, 1);
-    const int  n_blocks_x = (ne00 + 2 * CUDA_ROPE_BLOCK_SIZE - 1) / (2 * CUDA_ROPE_BLOCK_SIZE);
+    const int  rope_bs    = ggml_cuda_rope_block_size(ne00);
+    const dim3 block_dims(1, rope_bs, 1);
+    const int  n_blocks_x = (ne00 + 2 * rope_bs - 1) / (2 * rope_bs);
     const dim3 block_nums(nr, n_blocks_x, 1);
 
     const float theta_scale = powf(freq_base, -2.0f / n_dims);
@@ -425,8 +460,9 @@ static void rope_neox_cuda(const T *            x,
                            const bool           inplace,
                            cudaStream_t         stream) {
     GGML_ASSERT(ne00 % 2 == 0);
-    const dim3 block_dims(1, CUDA_ROPE_BLOCK_SIZE, 1);
-    const int  n_blocks_x = (ne00 + 2 * CUDA_ROPE_BLOCK_SIZE - 1) / (2 * CUDA_ROPE_BLOCK_SIZE);
+    const int  rope_bs    = ggml_cuda_rope_block_size(ne00);
+    const dim3 block_dims(1, rope_bs, 1);
+    const int  n_blocks_x = (ne00 + 2 * rope_bs - 1) / (2 * rope_bs);
     const dim3 block_nums(nr, n_blocks_x, 1);
 
     const float theta_scale = powf(freq_base, -2.0f / n_dims);
@@ -470,8 +506,9 @@ static void rope_multi_cuda(const T *            x,
                             const bool           inplace,
                             cudaStream_t         stream) {
     GGML_ASSERT(ne00 % 2 == 0);
-    const dim3 block_dims(1, CUDA_ROPE_BLOCK_SIZE, 1);
-    const int  n_blocks_x = (ne00 + 2 * CUDA_ROPE_BLOCK_SIZE - 1) / (2 * CUDA_ROPE_BLOCK_SIZE);
+    const int  rope_bs    = ggml_cuda_rope_block_size(ne00);
+    const dim3 block_dims(1, rope_bs, 1);
+    const int  n_blocks_x = (ne00 + 2 * rope_bs - 1) / (2 * rope_bs);
     const dim3 block_nums(nr, n_blocks_x, 1);
 
     const float theta_scale = powf(freq_base, -2.0f / n_dims);
@@ -513,8 +550,9 @@ static void rope_vision_cuda(const T *            x,
                              const mrope_sections sections,
                              cudaStream_t         stream) {
     GGML_ASSERT(ne00 % 2 == 0);
-    const dim3 block_dims(1, CUDA_ROPE_BLOCK_SIZE, 1);
-    const int  n_blocks_x = (ne00 + 2 * CUDA_ROPE_BLOCK_SIZE - 1) / (2 * CUDA_ROPE_BLOCK_SIZE);
+    const int  rope_bs    = ggml_cuda_rope_block_size(ne00);
+    const dim3 block_dims(1, rope_bs, 1);
+    const int  n_blocks_x = (ne00 + 2 * rope_bs - 1) / (2 * rope_bs);
     const dim3 block_nums(nr, n_blocks_x, 1);
     // break down (head_dim, heads, seq) into (CUDA_ROPE_BLOCK_SIZE, x, heads * seq)
     // where x ~= ceil(head_dim / CUDA_ROPE_BLOCK_SIZE);
