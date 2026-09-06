@@ -1100,9 +1100,10 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "GLU",
 
     "MUL_COLLAPSE",
+    "HC_COMBINE",
 };
 
-static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
+static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1217,9 +1218,10 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "glu(x)",
 
     "collapse(a*b)",
+    "hc_combine(r,b,w)",
 };
 
-static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
+static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -2502,6 +2504,36 @@ struct ggml_tensor * ggml_sum_rows(
 
     result->op     = GGML_OP_SUM_ROWS;
     result->src[0] = a;
+
+    return result;
+}
+
+struct ggml_tensor * ggml_hc_combine(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * residual,
+        struct ggml_tensor  * b,
+        struct ggml_tensor  * w,
+        float                 s_in,
+        float                 s_out) {
+    GGML_ASSERT(residual->type == GGML_TYPE_F32);
+    GGML_ASSERT(b->type == GGML_TYPE_F32);
+    GGML_ASSERT(w->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous(residual));
+    GGML_ASSERT(ggml_is_contiguous(b));
+    GGML_ASSERT(ggml_is_contiguous(w));
+    GGML_ASSERT(residual->ne[3] == 1);
+    GGML_ASSERT(ggml_nelements(b) == residual->ne[0]*residual->ne[2]);
+    GGML_ASSERT(ggml_nelements(w) == residual->ne[1]*residual->ne[2]);
+
+    struct ggml_tensor * result = ggml_new_tensor(ctx, residual->type, GGML_MAX_DIMS, residual->ne);
+
+    float params[2] = { s_in, s_out };
+    ggml_set_op_params(result, params, sizeof(params));
+
+    result->op     = GGML_OP_HC_COMBINE;
+    result->src[0] = residual;
+    result->src[1] = b;
+    result->src[2] = w;
 
     return result;
 }

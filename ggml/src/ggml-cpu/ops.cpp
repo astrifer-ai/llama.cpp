@@ -1455,11 +1455,104 @@ void ggml_compute_forward_cumsum(
     }
 }
 
+// ggml_compute_forward_hc_combine
+
+static void ggml_compute_forward_hc_combine_f32(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+
+    const ggml_tensor * res = dst->src[0];
+    const ggml_tensor * b   = dst->src[1];
+    const ggml_tensor * w   = dst->src[2];
+
+    GGML_ASSERT(ggml_is_contiguous(res) && ggml_is_contiguous(b) && ggml_is_contiguous(w));
+    GGML_ASSERT(ggml_is_contiguous(dst));
+
+    float p[2];
+    memcpy(p, dst->op_params, sizeof(p));
+    const float s_in = p[0], s_out = p[1];
+
+    const int64_t ne0 = res->ne[0], ne1 = res->ne[1], ne2 = res->ne[2];
+
+    const float * rp = (const float *) res->data;
+    const float * bp = (const float *) b->data;
+    const float * wp = (const float *) w->data;
+    float       * dp = (float *)       dst->data;
+
+    const int64_t nrows = ne1*ne2;
+    for (int64_t ir = params->ith; ir < nrows; ir += params->nth) {
+        const int64_t i1 = ir % ne1;
+        const int64_t i2 = ir / ne1;
+        const float gate = s_out / (1.0f + expf(-s_in*wp[i2*ne1 + i1]));
+        const int64_t rb = (i2*ne1 + i1)*ne0;
+        const int64_t bb = i2*ne0;
+        for (int64_t i0 = 0; i0 < ne0; ++i0) {
+            dp[rb + i0] = rp[rb + i0] + bp[bb + i0]*gate;
+        }
+    }
+}
+
+void ggml_compute_forward_hc_combine(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    switch (dst->src[0]->type) {
+        case GGML_TYPE_F32: ggml_compute_forward_hc_combine_f32(params, dst); break;
+        default: GGML_ABORT("fatal error");
+    }
+}
+
 // ggml_compute_forward_mul_collapse
+
+// ===========================================================================================
+// THE ARITHMETIC CONTRACT -- this function is the REFERENCE the GPU kernel is gated against.
+//
+// It must compute exactly what the unfused mul + cont + (ne1-1) x add + scale chain computes:
+// ggml_mul rounds every product to f32 BEFORE anything is summed. If the compiler contracts
+// `acc += ap[i0] * bp[i0]` into an FMA, the product is carried at full internal precision, that
+// rounding never happens, and this reference becomes wrong.
+//
+// That matters more here than in the kernel, because test-backend-ops compares the GPU kernel
+// against THIS code. A contracting reference does not merely drift -- it INVERTS the gate: it
+// would pass a contracted GPU kernel and fail a correct one.
+//
+// GCC 13.3 was measured to contract a plain dot loop at -O3 -march=native (7 vfmadd), so the
+// property must be stated, not inherited from whatever the toolchain happens to do. Note that
+// `#pragma STDC FP_CONTRACT OFF` was measured to be SILENTLY IGNORED by g++ -- do not "simplify"
+// the guard below to it. Verified mechanisms: `#pragma clang fp contract(off)` (clang) and
+// `#pragma GCC optimize("fp-contract=off")` (gcc), both taking a contracting control loop to
+// zero vfmadd.
+// ===========================================================================================
+
+#if defined(__clang__) || defined(__GNUC__) || defined(_MSC_VER)
+   // contraction is disabled explicitly below for this compiler
+#elif defined(GGML_MUL_COLLAPSE_ALLOW_UNGUARDED_CPU_REF)
+#  pragma message("ggml_compute_forward_mul_collapse_f32: building the reference WITHOUT a " \
+                  "contraction guard because GGML_MUL_COLLAPSE_ALLOW_UNGUARDED_CPU_REF is set. If " \
+                  "this compiler contracts the accumulate, the MUL_COLLAPSE gate INVERTS. Verify " \
+                  "with an exact uint32 comparison before trusting it.")
+#else
+#  error "ggml_compute_forward_mul_collapse_f32 needs FP contraction disabled, and this compiler \
+provides no mechanism this file knows about. This function is the REFERENCE that test-backend-ops \
+compares the GPU kernel against: if it contracts, it stops matching the mul+cont+add+scale chain \
+and the MUL_COLLAPSE gate does not merely drift, it INVERTS -- passing a contracted GPU kernel and \
+failing a correct one. Add a contraction-disabling mechanism for this compiler above, or define \
+GGML_MUL_COLLAPSE_ALLOW_UNGUARDED_CPU_REF once you have checked with an exact uint32 comparison \
+that this compiler does not contract the accumulate."
+#endif
+
+#if defined(__GNUC__) && !defined(__clang__)
+#pragma GCC push_options
+#pragma GCC optimize ("fp-contract=off")
+#elif defined(_MSC_VER)
+#pragma fp_contract (off)
+#endif
 
 static void ggml_compute_forward_mul_collapse_f32(
         const ggml_compute_params * params,
         ggml_tensor * dst) {
+#if defined(__clang__)
+#pragma clang fp contract(off)
+#endif
 
     const ggml_tensor * src0 = dst->src[0];
     const ggml_tensor * src1 = dst->src[1];
@@ -1494,7 +1587,8 @@ static void ggml_compute_forward_mul_collapse_f32(
 
         for (int64_t i0 = 0; i0 < ne00; ++i0) {
             float acc = 0.0f;
-            // i1 ascending: same summation order as the add-chain this replaces
+            // i1 ascending: same summation order as the add-chain this replaces. Contraction is
+            // disabled above, so each ap[i0]*bp[i0] is rounded to f32 on its own, as ggml_mul does.
             for (int64_t i1 = 0; i1 < ne01; ++i1) {
                 const float * ap = (const float *) ((const char *) src0->data + i1*nb01 + i2*nb02 + i3*nb03);
                 const float * bp = (const float *) ((const char *) src1->data + i1*nb11 + i2*nb12 + i3*nb13);
@@ -1504,6 +1598,10 @@ static void ggml_compute_forward_mul_collapse_f32(
         }
     }
 }
+
+#if defined(__GNUC__) && !defined(__clang__)
+#pragma GCC pop_options
+#endif
 
 void ggml_compute_forward_mul_collapse(
         const ggml_compute_params * params,

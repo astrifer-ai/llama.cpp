@@ -6780,6 +6780,36 @@ struct test_sum : public test_case {
     }
 };
 
+// GGML_OP_HC_COMBINE
+struct test_hc_combine : public test_case {
+    const std::array<int64_t, 3> ne;   // {ne0, ne1, ne2}
+    const float s_in;
+    const float s_out;
+
+    std::string vars() override { return VARS_TO_STR3(ne, s_in, s_out); }
+
+    test_hc_combine(std::array<int64_t, 3> ne = {2560, 4, 1}, float s_in = 0.25f, float s_out = 2.0f)
+        : ne(ne), s_in(s_in), s_out(s_out) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int64_t rne[4] = { ne[0], ne[1], ne[2], 1 };
+        ggml_tensor * res = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, rne);
+        ggml_set_param(res); ggml_set_name(res, "res");
+
+        const int64_t bne[4] = { ne[0], ne[2], 1, 1 };
+        ggml_tensor * b = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, bne);
+        ggml_set_param(b); ggml_set_name(b, "b");
+
+        const int64_t wne[4] = { ne[1], ne[2], 1, 1 };
+        ggml_tensor * w = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, wne);
+        ggml_set_param(w); ggml_set_name(w, "w");
+
+        ggml_tensor * out = ggml_hc_combine(ctx, res, b, w, s_in, s_out);
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
 // GGML_OP_MUL_COLLAPSE
 struct test_mul_collapse : public test_case {
     const ggml_type type;
@@ -10062,6 +10092,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_sum(GGML_TYPE_F32, { 33, 1024, 1, 1 }));
     test_cases.emplace_back(new test_sum(GGML_TYPE_F32, { 33, 256, 1, 1 }));
     test_cases.emplace_back(new test_sum(GGML_TYPE_F32, { 33, 256, 1, 1 }, { 1, 0, 2, 3 })); // sum dst not-contiguous
+    test_cases.emplace_back(new test_hc_combine({2560, 4, 1}));     // qwen4exp decode, 1 token
+    test_cases.emplace_back(new test_hc_combine({2560, 4, 5}));     // 5 users
+    test_cases.emplace_back(new test_hc_combine({2560, 4, 512}));   // a prefill ubatch
+    test_cases.emplace_back(new test_hc_combine({1, 3, 2}, 1.0f, 1.0f)); // narrow edge
     test_cases.emplace_back(new test_mul_collapse(GGML_TYPE_F32, {2560, 4, 1,  1}, 0.25f));  // qwen4exp decode, 1 token
     test_cases.emplace_back(new test_mul_collapse(GGML_TYPE_F32, {2560, 4, 5,  1}, 0.25f));  // 5 users
     test_cases.emplace_back(new test_mul_collapse(GGML_TYPE_F32, {2560, 4, 512,1}, 0.25f));  // a prefill ubatch

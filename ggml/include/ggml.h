@@ -591,6 +591,7 @@ extern "C" {
         GGML_OP_GLU,
 
         GGML_OP_MUL_COLLAPSE,
+        GGML_OP_HC_COMBINE,
 
         GGML_OP_COUNT,
     };
@@ -1056,6 +1057,19 @@ extern "C" {
     // a and b must have the same shape, be F32 and contiguous.
     // The reduction runs i1 ascending, so the result is bit-identical to
     // scale * (((a*b)[..0..] + (a*b)[..1..]) + ...), which is what this replaces.
+    // residual + b * (s_out * sigmoid(s_in * w)), with b broadcast over dim 1 and
+    // w broadcast over dim 0:
+    //   dst[i0,i1,i2] = residual[i0,i1,i2] + b[i0,i2] * (s_out * sigmoid(s_in * w[i1,i2]))
+    // residual is [ne0,ne1,ne2,1]; b holds ne0*ne2 elements, w holds ne1*ne2. All F32,
+    // all contiguous. Fuses scale+sigmoid+scale+repeat+mul+add into one kernel.
+    GGML_API struct ggml_tensor * ggml_hc_combine(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * residual,
+            struct ggml_tensor  * b,
+            struct ggml_tensor  * w,
+            float                 s_in,
+            float                 s_out);
+
     GGML_API struct ggml_tensor * ggml_mul_collapse(
             struct ggml_context * ctx,
             struct ggml_tensor  * a,

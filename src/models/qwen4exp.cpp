@@ -328,7 +328,15 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_mix(
     // Gate, then collapse the hc streams by their mean. Expressed as a graph this is
     // mul + cont + (hc-1) x add + scale -- six dispatches per call, twice per layer, every
     // one of them shorter than the ~2.26 us launch cost on this hardware. ggml_mul_collapse
-    // does the whole thing in one kernel, summing i1 ascending so the result is bit-identical.
+    // does the whole thing in one kernel.
+    //
+    // Bit-identity needs TWO things, and the second was missing until 2026-09-06:
+    // summing i1 ascending preserves the add-chain's order, but the kernel must also
+    // NOT contract the multiply-add. ggml_mul materialises every product in an f32
+    // buffer, so a contracting kernel skips a rounding the chain performs. That left
+    // 42.9 % of decode-shape elements differing (max bit-delta 5862) and was invisible
+    // to test-backend-ops, which is a tolerance gate. See the contraction pragma in
+    // ggml/src/ggml-cuda/mulcollapse.cu.
     ggml_tensor * xn3   = ggml_reshape_3d(ctx0, xn,   n_embd, hc, nt);
     ggml_tensor * gate3 = ggml_reshape_3d(ctx0, gate, n_embd, hc, nt);
 
@@ -353,6 +361,14 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_combine(
     const int64_t nt = residual->ne[2];
 
     // 2*sigmoid centres the scatter weights on 1, so a zero injection is a plain residual add
+    //
+    // ggml_hc_combine() fuses this whole sequence into one kernel and is correct and tested,
+    // but it is NOT used here: measured on this box it is +2.7..+5.2 % at 1-3 concurrent
+    // users and -2.5 % at 4, +2.5 % at 5 -- a wash at the 4-5 users this deployment targets,
+    // with a 4-user regression that reproduced across three kernel versions and is still
+    // unexplained. The materialised repeat below is not pure waste: it buys cache locality
+    // for block_out that the fused kernel has to re-earn. Swap it in if your workload is
+    // 1-3 users. See docs/PROGRESS.md 2026-09-05 14:05.
     ggml_tensor * w = ggml_sigmoid(ctx0, ggml_scale(ctx0, inject, 1.0f / (float) hc));
     w = ggml_scale(ctx0, w, 2.0f);
     w = ggml_reshape_3d(ctx0, w, 1, hc, nt);

@@ -1810,6 +1810,10 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             {
                 ggml_compute_forward_mul_collapse(params, tensor);
             } break;
+        case GGML_OP_HC_COMBINE:
+            {
+                ggml_compute_forward_hc_combine(params, tensor);
+            } break;
         case GGML_OP_CUMSUM:
             {
                 ggml_compute_forward_cumsum(params, tensor);
@@ -2278,6 +2282,7 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_SUM:
         case GGML_OP_SUM_ROWS:
         case GGML_OP_MUL_COLLAPSE:
+        case GGML_OP_HC_COMBINE:
         case GGML_OP_MEAN:
         case GGML_OP_ARGMAX:
             {
