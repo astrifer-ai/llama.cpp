@@ -46,12 +46,14 @@
 #include "ggml-cuda/scale.cuh"
 #include "ggml-cuda/snake.cuh"
 #include "ggml-cuda/softcap.cuh"
+#include "ggml-cuda/sigmoidscale.cuh"
 #include "ggml-cuda/softmax.cuh"
 #include "ggml-cuda/ssm-conv.cuh"
 #include "ggml-cuda/ssm-scan.cuh"
 #include "ggml-cuda/sum.cuh"
 #include "ggml-cuda/sumrows.cuh"
 #include "ggml-cuda/mulcollapse.cuh"
+#include "ggml-cuda/gathermean.cuh"
 #include "ggml-cuda/hccombine.cuh"
 #include "ggml-cuda/top-k.cuh"
 #include "ggml-cuda/mean.cuh"
@@ -2349,6 +2351,9 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
         case GGML_OP_MUL_COLLAPSE:
             ggml_cuda_op_mul_collapse(ctx, dst);
             break;
+        case GGML_OP_GATHER_MEAN:
+            ggml_cuda_op_gather_mean(ctx, dst);
+            break;
         case GGML_OP_HC_COMBINE:
             ggml_cuda_op_hc_combine(ctx, dst);
             break;
@@ -3429,15 +3434,16 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
     }
 
     if (ops.size() == 3 && ops.begin()[0] == GGML_OP_SCALE && ops.begin()[1] == GGML_OP_UNARY && ops.begin()[2] == GGML_OP_SCALE
-     && unary_ops.size() == 1 && unary_ops.begin()[0] == GGML_UNARY_OP_TANH) {
+     && unary_ops.size() == 1
+     && (unary_ops.begin()[0] == GGML_UNARY_OP_TANH || unary_ops.begin()[0] == GGML_UNARY_OP_SIGMOID)) {
         const ggml_tensor *scale  = cgraph->nodes[node_idx];
-        const ggml_tensor *tanh   = cgraph->nodes[node_idx+1];
+        const ggml_tensor *unary  = cgraph->nodes[node_idx+1];
         const ggml_tensor *scale2 = cgraph->nodes[node_idx+2];
 
         GGML_ASSERT(scale->src[0]->type == GGML_TYPE_F32);
         GGML_ASSERT(scale->type == GGML_TYPE_F32);
 
-        if (ggml_get_unary_op(tanh) != GGML_UNARY_OP_TANH) {
+        if (ggml_get_unary_op(unary) != unary_ops.begin()[0]) {
             return false;
         }
 
@@ -4203,6 +4209,21 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         return 2;
     }
 
+    // qwen4exp writes its hyper-connection scatter weight as 2*sigmoid(inject/hc): three
+    // kernels on a [hc, n_tokens] tensor, 96 times per decode step. Set
+    // GGML_CUDA_FUSE_SIGMOID_SCALE=0 to A/B it without relinking.
+    static const bool fuse_sigmoid_scale =
+        getenv("GGML_CUDA_FUSE_SIGMOID_SCALE") == nullptr || std::atoi(getenv("GGML_CUDA_FUSE_SIGMOID_SCALE")) != 0;
+
+    // the kernel indexes both tensors flat, as ggml_cuda_op_scale does, so require contiguity
+    // here rather than assert inside the op: a future graph could hold a strided scale
+    if (fuse_sigmoid_scale &&
+        ggml_cuda_can_fuse(cgraph, i, { GGML_OP_SCALE, GGML_OP_UNARY, GGML_OP_SCALE }, { GGML_UNARY_OP_SIGMOID }) &&
+        ggml_is_contiguous(node->src[0]) && ggml_is_contiguous(cgraph->nodes[i + 2])) {
+        ggml_cuda_op_scale_sigmoid_scale(*cuda_ctx, cgraph->nodes[i + 2], node);
+        return 2;
+    }
+
     return 0;
 }
 
@@ -4346,7 +4367,45 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     continue;
                 }
 
+                // GGML_DISPATCH_DUMP=<path>: append one line per dispatched node, for
+                // GGML_DISPATCH_DUMP_SPLITS (default 200) scheduler splits starting at split
+                // GGML_DISPATCH_DUMP_FROM (default 1), so a steady-state decode graph can be
+                // attributed to graph nodes by name instead of guessed from a kernel trace.
+                // Off unless the path variable is set; the checks are one-time static inits.
+                static const char * const dispatch_dump = getenv("GGML_DISPATCH_DUMP");
+                FILE * dump = nullptr;
+                int    split_no = 0;
+                if (dispatch_dump) {
+                    static const char * const from_env  = getenv("GGML_DISPATCH_DUMP_FROM");
+                    static const char * const cnt_env   = getenv("GGML_DISPATCH_DUMP_SPLITS");
+                    static const int          from      = from_env ? atoi(from_env) : 1;
+                    static const int          n_splits  = cnt_env  ? atoi(cnt_env)  : 200;
+                    static std::map<int, int> splits;
+                    static std::mutex         dump_mutex;
+                    std::lock_guard<std::mutex> lock(dump_mutex);
+                    if (i == 0) {
+                        splits[cuda_ctx->device]++;
+                    }
+                    split_no = splits[cuda_ctx->device];
+                    if (split_no >= from && split_no < from + n_splits) {
+                        char path[512];
+                        snprintf(path, sizeof(path), "%s.dev%d", dispatch_dump, cuda_ctx->device);
+                        dump = fopen(path, "a");
+                    }
+                }
+
                 int nodes_to_skip = ggml_cuda_try_fuse(cuda_ctx, cgraph, i);
+
+                if (dump) {
+                    const ggml_tensor * last = cgraph->nodes[i + nodes_to_skip];
+                    fprintf(dump, "%d\t%d\t%d\t%s\t%s\t%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64 "\t%s\t%s\t%s\n",
+                            split_no, i, nodes_to_skip + 1, ggml_op_name(node->op), node->name,
+                            node->ne[0], node->ne[1], node->ne[2], node->ne[3],
+                            node->op == GGML_OP_UNARY ? ggml_unary_op_name(ggml_get_unary_op(node)) : "-",
+                            nodes_to_skip ? ggml_op_name(last->op) : "-",
+                            nodes_to_skip ? last->name : "-");
+                    fclose(dump);
+                }
 
                 if (nodes_to_skip != 0) {
 #ifdef GGML_CUDA_DEBUG
@@ -5496,6 +5555,22 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
         case GGML_OP_MEAN:
         case GGML_OP_GROUP_NORM:
             return ggml_is_contiguous(op->src[0]);
+        case GGML_OP_GATHER_MEAN:
+            // the same type set ggml_gather_mean's CUDA dispatch handles, which is the set
+            // -ctk / -ctv accept, so a KV cache of any allowed precision can feed it
+            switch (op->src[0]->type) {
+                case GGML_TYPE_F32:
+                case GGML_TYPE_F16:
+                case GGML_TYPE_BF16:
+                case GGML_TYPE_Q4_0:
+                case GGML_TYPE_Q4_1:
+                case GGML_TYPE_Q5_0:
+                case GGML_TYPE_Q5_1:
+                case GGML_TYPE_Q8_0:
+                    return op->src[1]->type == GGML_TYPE_I32 && ggml_is_contiguous_rows(op->src[0]);
+                default:
+                    return false;
+            }
         case GGML_OP_PAD:
             return true;
         case GGML_OP_UPSCALE:

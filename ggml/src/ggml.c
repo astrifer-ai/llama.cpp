@@ -1101,9 +1101,10 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
 
     "MUL_COLLAPSE",
     "HC_COMBINE",
+    "GATHER_MEAN",
 };
 
-static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
+static_assert(GGML_OP_COUNT == 104, "GGML_OP_COUNT != 104");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1219,9 +1220,10 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
 
     "collapse(a*b)",
     "hc_combine(r,b,w)",
+    "gather_mean(a,ids)",
 };
 
-static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
+static_assert(GGML_OP_COUNT == 104, "GGML_OP_COUNT != 104");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -2534,6 +2536,50 @@ struct ggml_tensor * ggml_hc_combine(
     result->src[0] = residual;
     result->src[1] = b;
     result->src[2] = w;
+
+    return result;
+}
+
+bool ggml_gather_mean_supported(enum ggml_type type) {
+    switch (type) {
+        case GGML_TYPE_F32:
+        case GGML_TYPE_F16:
+        case GGML_TYPE_BF16:
+        case GGML_TYPE_Q4_0:
+        case GGML_TYPE_Q4_1:
+        case GGML_TYPE_Q5_0:
+        case GGML_TYPE_Q5_1:
+        case GGML_TYPE_Q8_0:
+            return true;
+        default:
+            return false;
+    }
+}
+
+struct ggml_tensor * ggml_gather_mean(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a,
+        struct ggml_tensor  * ids,
+        int                   n_group,
+        float                 scale) {
+    GGML_ASSERT(ids->type == GGML_TYPE_I32);
+    GGML_ASSERT(n_group > 0);
+    GGML_ASSERT(ids->ne[0] % n_group == 0);
+    GGML_ASSERT(a->ne[2] == ids->ne[1]);
+    GGML_ASSERT(a->ne[3] == ids->ne[2]);
+    GGML_ASSERT(ids->ne[3] == 1);
+    GGML_ASSERT(ggml_is_contiguous_rows(a));
+
+    struct ggml_tensor * result =
+        ggml_new_tensor_4d(ctx, GGML_TYPE_F32, a->ne[0], ids->ne[0]/n_group, ids->ne[1], ids->ne[2]);
+
+    int32_t params_i[1] = { n_group };
+    ggml_set_op_params_i32(result, 0, params_i[0]);
+    ggml_set_op_params_f32(result, 1, scale);
+
+    result->op     = GGML_OP_GATHER_MEAN;
+    result->src[0] = a;
+    result->src[1] = ids;
 
     return result;
 }

@@ -1603,6 +1603,85 @@ static void ggml_compute_forward_mul_collapse_f32(
 #pragma GCC pop_options
 #endif
 
+// dst[i0, b, i2, i3] = scale * sum_{j < n_group} a[i0, ids[b*n_group + j, i2, i3], i2, i3]
+// Reference for GGML_OP_GATHER_MEAN. Dequantises a row at a time with the type's to_float, as
+// ggml_get_rows does, then sums the members ascending starting from member 0 -- the same order
+// the get_rows + cont + add + scale chain uses.
+static void ggml_compute_forward_gather_mean_impl(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    const ggml_tensor * src0 = dst->src[0];
+    const ggml_tensor * ids  = dst->src[1];
+
+    GGML_ASSERT(ids->type == GGML_TYPE_I32);
+    GGML_ASSERT(dst->type == GGML_TYPE_F32);
+
+    const int   n_group = ggml_get_op_params_i32(dst, 0);
+    const float scale   = ggml_get_op_params_f32(dst, 1);
+
+    const int64_t ne00  = src0->ne[0];
+    const int64_t n_out = dst->ne[1];
+    const int64_t ne2   = dst->ne[2];
+    const int64_t ne3   = dst->ne[3];
+
+    // F32 has no to_float in the type traits -- it is already float, so read the row directly
+    const ggml_type_traits * tt = ggml_get_type_traits(src0->type);
+    ggml_to_float_t const to_float = tt->to_float;
+    GGML_ASSERT(to_float != NULL || src0->type == GGML_TYPE_F32);
+
+    const int ith = params->ith;
+    const int nth = params->nth;
+
+    // one scratch row per thread; this path is a reference and a fallback, not a hot path,
+    // so it allocates rather than claiming a slice of wdata the plan does not size for it
+    std::vector<float> rowbuf(ne00);
+    float * row = rowbuf.data();
+
+    const int64_t nrows = n_out*ne2*ne3;
+    for (int64_t ir = ith; ir < nrows; ir += nth) {
+        const int64_t b   =  ir % n_out;
+        const int64_t i2  = (ir / n_out) % ne2;
+        const int64_t i3  =  ir / (n_out*ne2);
+
+        float * dst_row = (float *) ((char *) dst->data + b*dst->nb[1] + i2*dst->nb[2] + i3*dst->nb[3]);
+
+        for (int j = 0; j < n_group; ++j) {
+            const int32_t * ids_p = (const int32_t *)
+                ((const char *) ids->data + (b*n_group + j)*ids->nb[0] + i2*ids->nb[1] + i3*ids->nb[2]);
+            const int64_t i01 = *ids_p;
+            GGML_ASSERT(i01 >= 0 && i01 < src0->ne[1]);
+
+            const void * src_row = (const char *) src0->data + i01*src0->nb[1] + i2*src0->nb[2] + i3*src0->nb[3];
+            const float * src_f;
+            if (to_float) {
+                to_float(src_row, row, ne00);
+                src_f = row;
+            } else {
+                src_f = (const float *) src_row;
+            }
+
+            if (j == 0) {
+                for (int64_t i0 = 0; i0 < ne00; ++i0) {
+                    dst_row[i0] = src_f[i0];
+                }
+            } else {
+                for (int64_t i0 = 0; i0 < ne00; ++i0) {
+                    dst_row[i0] += src_f[i0];
+                }
+            }
+        }
+        for (int64_t i0 = 0; i0 < ne00; ++i0) {
+            dst_row[i0] *= scale;
+        }
+    }
+}
+
+void ggml_compute_forward_gather_mean(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    ggml_compute_forward_gather_mean_impl(params, dst);
+}
+
 void ggml_compute_forward_mul_collapse(
         const ggml_compute_params * params,
         ggml_tensor * dst) {

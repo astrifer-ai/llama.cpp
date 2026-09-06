@@ -592,6 +592,7 @@ extern "C" {
 
         GGML_OP_MUL_COLLAPSE,
         GGML_OP_HC_COMBINE,
+        GGML_OP_GATHER_MEAN,
 
         GGML_OP_COUNT,
     };
@@ -1074,6 +1075,23 @@ extern "C" {
             struct ggml_context * ctx,
             struct ggml_tensor  * a,
             struct ggml_tensor  * b,
+            float                 scale);
+
+    // gather rows by id and average consecutive groups of them in one pass
+    //   dst[i0, b, i2, i3] = scale * sum_{j < n_group} a[i0, ids[b*n_group + j, i2, i3], i2, i3]
+    // ids indexes a's ne1 exactly as ggml_get_rows does, so a may be quantized.
+    // a:   [ne00, ne01, ne02, ne03]
+    // ids: I32 [n_group*n_out, ne02, ne03]
+    // dst: F32 [ne00, n_out, ne02, ne03]
+    // true if a backend fast path exists for this type; if false, build the unfused chain
+    // rather than letting the scheduler place GATHER_MEAN on the CPU and copy the cache to host
+    GGML_API bool ggml_gather_mean_supported(enum ggml_type type);
+
+    GGML_API struct ggml_tensor * ggml_gather_mean(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            struct ggml_tensor  * ids,
+            int                   n_group,
             float                 scale);
 
     GGML_API struct ggml_tensor * ggml_cumsum(

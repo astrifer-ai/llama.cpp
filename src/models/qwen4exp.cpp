@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <cinttypes>
+#include <cstdlib>
 
 // bad metadata must be catchable: GGML_ASSERT aborts the whole process
 static void qwen4exp_require_nonzero(const llama_model_loader & ml, llm_kv kid, uint32_t value) {
@@ -824,19 +825,46 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
     ggml_tensor * k_all = mctx_idx->get_k(ctx0, il);
     k_all = ggml_view_3d(ctx0, k_all, idx_dim, n_kv, n_stream, k_all->nb[2], k_all->nb[3], 0);
 
-    // gathers per stream: blk_cells row s indexes stream s's own cells
-    ggml_tensor * members = ggml_get_rows(ctx0, k_all, inp->blk_cells);
-    members = ggml_reshape_4d(ctx0, members, idx_dim, r, n_blocks, n_stream);
+    // gathers per stream: blk_cells row s indexes stream s's own cells.
+    // only the unfused chain needs this materialised; ggml_gather_mean() gathers internally.
+    const bool pool_chain_needed =
+        (getenv("GGML_QWEN4EXP_POOL_CHAIN") != nullptr && atoi(getenv("GGML_QWEN4EXP_POOL_CHAIN")) != 0) ||
+        !ggml_gather_mean_supported(k_all->type);
 
-    // mean over the block members; r is small, so summing slices beats a transpose plus sum_rows
-    ggml_tensor * pooled = nullptr;
-    for (int64_t i = 0; i < r; ++i) {
-        ggml_tensor * slice = ggml_cont(ctx0,
-                ggml_view_3d(ctx0, members, idx_dim, n_blocks, n_stream,
-                        members->nb[2], members->nb[3], i*members->nb[1]));
-        pooled = pooled ? ggml_add(ctx0, pooled, slice) : slice;
+    ggml_tensor * members = nullptr;
+    if (pool_chain_needed) {
+        members = ggml_get_rows(ctx0, k_all, inp->blk_cells);
+        members = ggml_reshape_4d(ctx0, members, idx_dim, r, n_blocks, n_stream);
     }
-    pooled = ggml_scale(ctx0, pooled, 1.0f/(float) r);
+
+    // mean over the block members. ggml_gather_mean() does the gather and the mean in one
+    // kernel; the chain below is get_rows + r x cont + (r-1) x add + scale, eight dispatches
+    // per attention layer that each walk the whole indexer cache. That is O(n_kv) per decode
+    // step: 0.6 % of the step at 1K and 11.8 % at 32K, where it measured 933 us per layer.
+    // The fused form reads the cache once and writes only the pooled result -- 35 MB against
+    // 406 MB per step at 32K.
+    // Set GGML_QWEN4EXP_POOL_CHAIN=1 to rebuild the unfused chain for an A/B on one binary.
+    static const bool pool_chain_env = getenv("GGML_QWEN4EXP_POOL_CHAIN") != nullptr &&
+                                       atoi(getenv("GGML_QWEN4EXP_POOL_CHAIN")) != 0;
+
+    // k-quant and IQ caches have no gather_mean fast path; build the chain rather than let
+    // the scheduler place the op on the CPU backend and copy the whole cache to host
+    const bool pool_chain = pool_chain_env || !ggml_gather_mean_supported(k_all->type);
+
+    ggml_tensor * pooled = nullptr;
+    if (pool_chain) {
+        // r is small, so summing slices beats a transpose plus sum_rows
+        for (int64_t i = 0; i < r; ++i) {
+            ggml_tensor * slice = ggml_cont(ctx0,
+                    ggml_view_3d(ctx0, members, idx_dim, n_blocks, n_stream,
+                            members->nb[2], members->nb[3], i*members->nb[1]));
+            pooled = pooled ? ggml_add(ctx0, pooled, slice) : slice;
+        }
+        pooled = ggml_scale(ctx0, pooled, 1.0f/(float) r);
+    } else {
+        pooled = ggml_gather_mean(ctx0, k_all, inp->blk_cells, (int) r, 1.0f/(float) r);
+        pooled = ggml_reshape_3d(ctx0, pooled, idx_dim, n_blocks, n_stream);
+    }
     cb(pooled, "indexer_k_pooled", il);
 
     // count blocks along ne1: rms_norm launches gridDim.y = ne2, capped at 65535, and 262144/4 = 65536
@@ -1191,7 +1219,18 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn_linear(
     // gated normalization, as self.norm(core_attn_out, z) in the reference
     ggml_tensor * attn_out_norm = build_norm_gated(output, model.layers[il].ssm_norm, z_2d, il);
 
-    ggml_tensor * final_output = ggml_reshape_3d(ctx0, attn_out_norm, head_v_dim * num_v_heads, n_seq_tokens, n_seqs);
+    // 2-D, not [d_inner, n_seq_tokens, n_seqs]. mul_mat_vec_q puts ne2 on gridDim.y and streams
+    // src0 once per channel, so the 3-D form reads ssm_out's whole weight matrix n_seqs times to
+    // produce the same numbers. attn_output has the identical [6144, 2560] shape and arrives 2-D:
+    // on the shipping model at 4 users it takes 39.5 us for 16.7 MB while ssm_out takes 42.9 us
+    // for 8.4 MB. attn_out_norm is contiguous, so the two forms are the same memory.
+    // Set GGML_QWEN4EXP_SSM_OUT_3D=1 to restore the old layout for an A/B on one binary.
+    static const bool ssm_out_3d = getenv("GGML_QWEN4EXP_SSM_OUT_3D") != nullptr &&
+                                   atoi(getenv("GGML_QWEN4EXP_SSM_OUT_3D")) != 0;
+
+    ggml_tensor * final_output = ssm_out_3d
+        ? ggml_reshape_3d(ctx0, attn_out_norm, head_v_dim * num_v_heads, n_seq_tokens, n_seqs)
+        : ggml_reshape_2d(ctx0, attn_out_norm, head_v_dim * num_v_heads, n_seq_tokens * n_seqs);
     cb(final_output, "final_output", il);
 
     cur = build_lora_mm(model.layers[il].ssm_out, final_output, model.layers[il].ssm_out_s);
