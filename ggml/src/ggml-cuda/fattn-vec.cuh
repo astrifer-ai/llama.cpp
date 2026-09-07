@@ -1,6 +1,12 @@
 #include "common.cuh"
 #include "fattn-common.cuh"
 
+// Skip flash-attention tiles whose mask is entirely -INFINITY. On by default; build with
+// -DGGML_FATTN_SKIP_MASKED_TILES=0 for a paired baseline that contains none of this code.
+#ifndef GGML_FATTN_SKIP_MASKED_TILES
+#define GGML_FATTN_SKIP_MASKED_TILES 1
+#endif
+
 static int ggml_cuda_fattn_vec_get_nthreads_host(const int cc) {
     return 128;
     GGML_UNUSED(cc);
@@ -254,6 +260,74 @@ static __global__ void flash_attn_ext_vec(
     for (int k_VKQ_0 = blockIdx.y*nthreads; k_VKQ_0 < k_VKQ_max; k_VKQ_0 += gridDim.y*nthreads,
              // Increment pointers after each loop:
              K += gridDim.y*nthreads*nb11, V += gridDim.y*nthreads*nb21, maskh += gridDim.y*nthreads) {
+
+#if GGML_FATTN_SKIP_MASKED_TILES
+        // ---------------------------------------------------------------------------------
+        // Skip this tile entirely when every one of its mask values is -INFINITY. QSA selects
+        // ~6 % of cells and hands the FULL K/V plus a mask to dense attention, so most tiles
+        // contribute nothing; flash attention measured 61.6 ms/step, 46.6 % of GPU busy, at
+        // 131K x 4.
+        //
+        // WHY THIS IS BIT-IDENTICAL, not merely close. A fully masked tile contributes
+        // exp(-inf) = +0 and cannot raise the running maximum, so processing it is already the
+        // identity -- but only because of four properties of the INITIALISATION, none of which
+        // are visible from this hunk alone:
+        //   1. KQ_max starts at -FLT_MAX/2, NOT -inf, so fmaxf(KQ_max, -inf + OFFSET) leaves it
+        //      unchanged and KQ_max_scale below is expf(0) = exactly 1.0f. x*1.0f == x bitwise
+        //      for every float, including +-0, +-inf and NaN.
+        //   2. KQ_sum starts at +0.0f and only ever accumulates non-negative expf results, so it
+        //      is never -0.0f and x + 0.0f == x holds bitwise. Were it ever -0.0f, adding +0.0f
+        //      would flip its sign -- the same signed-zero trap that bit the q4_0 pool fusion.
+        //   3. VKQ starts at +0.0f and cannot reach -0.0f (exact cancellation yields +0.0 under
+        //      round-to-nearest), so accumulating +-0.0 leaves it bitwise unchanged.
+        //   4. slope is EXACTLY 1.0f on this architecture: get_alibi_slope returns 1.0f
+        //      immediately when max_bias <= 0, and qwen4exp uses IMROPE rather than ALiBi, so
+        //      slope*(-inf) is -inf and the 0*(-inf) = NaN hazard cannot arise at all. A porter
+        //      inherits only the conditional half of this: on an ALiBi model slope weakens to
+        //      powf(base, exph) with base in (0,1) -- still positive, but in principle able to
+        //      underflow to zero at extreme head counts, which would turn the masked sum into
+        //      NaN rather than -inf and break the skip silently.
+        // A block that skips every tile emits the same (max, sum, VKQ) it emits today, and
+        // flash_attn_combine_results already weights such a partial by expf(-FLT_MAX/2 - kqmax)
+        // = 0. That case is not new: it already occurs whenever a KV-split block's whole range
+        // is masked under causal attention.
+        //
+        // THE DECISION MUST BE BLOCK-UNIFORM. Do NOT turn this into a per-thread early-out, however
+        // tempting. The tile body writes KQ[j*nthreads + tid] to shared memory and then every
+        // thread reads OTHER threads' entries back via KQ[j*nthreads + k]. If some threads
+        // skipped and others did not, those reads return stale values and the output is
+        // silently WRONG -- no crash, no NaN, just wrong numbers. __syncthreads_or gives one
+        // answer to the whole block (same idiom as mmf.cuh:164). Safe here because the loop
+        // bounds are block-uniform and no thread returns before this point.
+        //
+        // Economics: the test reads nthreads mask values (256 B at f16) to avoid reading the
+        // tile's K (~32 KB at D=256) and its V. Roughly 1 % to save 100 %.        //
+        // READ RANGE -- and an inherited hazard, stated so it is not mistaken for a new one.
+        // The test reads maskh[j*ne11 + tid] for tid in [0, nthreads), which is EXACTLY the
+        // range the tile body below already reads as maskh[j*ne11 + i_KQ], i_KQ spanning
+        // [0, nthreads) in the same loop iteration. So this adds no out-of-bounds exposure of
+        // its own -- that equivalence, not any padding constant, is why it is safe.
+        //
+        // What it DOES inherit: get_n_kv() forces a pad of at least 256, then clamps with
+        // std::min(cells.size(), ...), so a FULL cache returns n_ctx_seq unrounded. With
+        // -c 100000 -np 4 that is 25000 per sequence -- not a multiple of the 128-wide tile --
+        // and the existing mask read would run past the row end. Code-derived, no observed
+        // instance, pre-existing upstream. Do not read this skip as evidence the range is safe;
+        // it is exactly as safe as the read that was already there.
+        // ---------------------------------------------------------------------------------
+        if (mask) {
+            bool live = false;
+#pragma unroll
+            for (int j = 0; j < ncols; ++j) {
+                if (ncols == 1 || ic0 + j < int(ne01.z)) {
+                    live = live || __half2float(maskh[j*ne11 + tid]) != -INFINITY;
+                }
+            }
+            if (!__syncthreads_or(live)) {
+                continue;
+            }
+        }
+#endif // GGML_FATTN_SKIP_MASKED_TILES
 
         // Calculate KQ tile and keep track of new maximum KQ values:
         float KQ_reg[ncols]; // KQ in registers.
